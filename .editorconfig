@@ -8,7 +8,7 @@ insert_final_newline = true
 trim_trailing_whitespace = true
 charset = utf-8
 
-# python, js indentation settings
+# Python, JavaScript, Vue, CSS, HTML - tabs with 4 spaces (Frappe standard)
 [{*.py,*.js,*.vue,*.css,*.scss,*.html}]
 indent_style = tab
 indent_size = 4
