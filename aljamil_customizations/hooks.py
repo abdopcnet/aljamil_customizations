@@ -148,7 +148,10 @@ doctype_js = {
 doc_events = {
     "Sales Order": {
         "before_save": "aljamil_customizations.sales_order.send_discount_approval_notifications",
-    }
+    },
+    "Sales Invoice": {
+        "before_save": "aljamil_customizations.sales_invoice.send_discount_approval_notifications",
+    },
 }
 
 # Scheduled Tasks
