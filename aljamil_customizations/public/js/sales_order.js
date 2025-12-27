@@ -52,107 +52,228 @@ frappe.ui.form.on('Sales Order', {
 });
 
 // ============================================
-// File 4: available_qty.js
+// File 3: stock_availability_check.js
+// Check if all items have sufficient stock before creating invoice
 // ============================================
-// =======================
-// Sales Order - Use projected_qty to show available qty
-// projected_qty = actual_qty + ordered_qty + indented_qty + planned_qty - reserved_qty - ...
-// =======================
+// NOTE: Stock check is now only done in Sales Invoice before_submit
+// This ensures we can save Sales Order but prevent invoice creation if items are insufficient
 
-frappe.ui.form.on('Sales Order Item', {
-	item_code(frm, cdt, cdn) {
-		// If custom table exists, skip native table updates
-		if (frm.fields_dict.custom_items_table) {
-			return; // Custom table handles updates
+// ============================================
+// Sales Invoice - Check stock before submission
+// Prevent creating invoice if items are out of stock
+// ============================================
+frappe.ui.form.on('Sales Invoice', {
+	before_submit: function (frm) {
+		// Only check if this is from Sales Order (has items_set relation)
+		if (frm.doc.items && frm.doc.items.length > 0) {
+			check_sales_invoice_stock(frm);
 		}
-		update_available_qty_strict(frm, cdt, cdn);
-	},
-	warehouse(frm, cdt, cdn) {
-		// If custom table exists, skip native table updates
-		if (frm.fields_dict.custom_items_table) {
-			return; // Custom table handles updates
-		}
-		update_available_qty_strict(frm, cdt, cdn);
-	},
-	qty(frm, cdt, cdn) {
-		// If custom table exists, skip native table updates
-		if (frm.fields_dict.custom_items_table) {
-			return; // Custom table handles updates
-		}
-		update_available_qty_strict(frm, cdt, cdn);
 	},
 });
 
+function check_sales_invoice_stock(frm) {
+	// Collect all items that need to be checked
+	const items_to_check = frm.doc.items
+		.map((item) => ({
+			item_code: item.item_code,
+			warehouse: item.warehouse,
+			qty: item.qty,
+		}))
+		.filter((item) => item.item_code && item.warehouse && item.qty > 0);
+
+	if (!items_to_check.length) return;
+
+	// Check stock for each item
+	frappe.call({
+		method: 'frappe.client.get_list',
+		args: {
+			doctype: 'Bin',
+			filters: {
+				item_code: ['in', items_to_check.map((i) => i.item_code)],
+			},
+			fields: ['name', 'item_code', 'warehouse', 'projected_qty'],
+		},
+		async: false,
+		callback: function (r) {
+			const bins = r.message || [];
+			const insufficient_items = [];
+
+			items_to_check.forEach((item) => {
+				// البحث عن الرصيد في هذا المخزن
+				const bin = bins.find(
+					(b) => b.item_code === item.item_code && b.warehouse === item.warehouse,
+				);
+
+				const available_qty = bin ? bin.projected_qty || 0 : 0;
+
+				// التحقق من توفر الكمية
+				if (available_qty < item.qty) {
+					insufficient_items.push({
+						item_code: item.item_code,
+						warehouse: item.warehouse,
+						required: item.qty,
+						available: available_qty,
+						short: item.qty - available_qty,
+					});
+				}
+			});
+
+			// إذا كان هناك منتجات ناقصة، يتم رفع خطأ ومنع الحفظ
+			if (insufficient_items.length > 0) {
+				let error_message =
+					'❌ <b>لا يمكن إنشاء الفاتورة - منتجات ناقصة في المخزن:</b><br>';
+				insufficient_items.forEach((item) => {
+					error_message += `
+						<div style="margin: 8px 0; padding: 8px; background-color: #fff3cd; border-left: 3px solid #ff6b6b; border-radius: 3px;">
+							<b style="color: #d9534f;">${item.item_code}</b> - ${item.warehouse}<br>
+							مطلوب: <b>${item.required}</b> | متاح: <b>${item.available}</b> | ناقص: <span style="color: red; font-weight: bold;">${item.short}</span>
+						</div>
+					`;
+				});
+				error_message += '<br>⚠️ يجب توفير المنتجات الناقصة في المخزن قبل إنشاء الفاتورة';
+
+				frappe.msgprint({
+					title: '❌ منتجات ناقصة',
+					message: error_message,
+					indicator: 'red',
+				});
+
+				frappe.throw(
+					__(
+						'لا يمكن إنشاء الفاتورة. الصنف غير موجود: ' +
+							insufficient_items.map((i) => i.item_code).join(', '),
+					),
+				);
+			}
+		},
+	});
+}
+
+// ============================================
+// الأزرار المخصصة لأمر البيع
+// 1. إنشاء طلب شراء (عدسات فقط) - خارج زر الإنشاء
+// 2. إنشاء فاتورة بيع - مع التحقق من المخزن
+// ============================================
 frappe.ui.form.on('Sales Order', {
 	refresh(frm) {
-		// If custom table exists, skip native table updates
-		if (frm.fields_dict.custom_items_table) {
-			return; // Custom table handles updates
-		}
+		if (frm.is_new()) return;
 
-		if (frm.doc.docstatus === 0) {
-			(frm.doc.items || []).forEach((d) => {
-				update_available_qty_strict(frm, d.doctype, d.name);
+		// عرض الأزرار فقط لأوامر البيع المحفوظة
+		if (frm.doc.docstatus === 1) {
+			// إزالة زر "فاتورة البيع" الافتراضي من قائمة الإنشاء
+			frm.page.clear_inner_toolbar();
+
+			// إضافة زر "إنشاء فاتورة بيع" مخصص (مستقل)
+			frm.add_custom_button(__('إنشاء فاتورة بيع'), () => {
+				create_sales_invoice_with_validation(frm);
+			}).addClass('btn-primary');
+
+			// إضافة زر "إنشاء طلب شراء (عدسات فقط)" (مستقل)
+			frm.add_custom_button(__('إنشاء طلب شراء (عدسات فقط)'), () => {
+				open_lens_po_dialog(frm);
 			});
 		}
-	},
-	onload_post_render(frm) {
-		// Subscribe to real-time warehouse stock updates
-		// If custom table exists, skip native table updates
-		if (frm.fields_dict.custom_items_table) {
-			return; // Custom table handles updates
-		}
-
-		frappe.realtime.on('bin_update', (data) => {
-			(frm.doc.items || []).forEach((d) => {
-				if (d.item_code === data.item_code && d.warehouse === data.warehouse) {
-					// Use projected_qty from Bin directly
-					const projected_qty = data.projected_qty || 0;
-					frappe.model.set_value(d.doctype, d.name, 'projected_qty', projected_qty);
-					refresh_field('items');
-				}
-			});
-		});
 	},
 });
 
-// =======================
-// Function to update projected_qty from Bin
-// projected_qty includes: actual_qty + ordered_qty + indented_qty + planned_qty - reserved_qty - ...
-// =======================
-function update_available_qty_strict(frm, cdt, cdn) {
-	// If custom table exists, skip native table updates
-	if (frm.fields_dict.custom_items_table) {
-		return; // Custom table handles updates
+// ============================================
+// Create Sales Invoice with stock validation
+// ============================================
+async function create_sales_invoice_with_validation(frm) {
+	// First check stock availability
+	const stock_check = await check_stock_before_invoice(frm);
+
+	if (!stock_check.success) {
+		// Show error message
+		let error_message = '❌ <b>لا يمكن إنشاء الفاتورة - منتجات ناقصة في المخزن:</b><br>';
+		stock_check.insufficient_items.forEach((item) => {
+			error_message += `
+				<div style="margin: 8px 0; padding: 8px; background-color: #fff3cd; border-left: 3px solid #ff6b6b; border-radius: 3px;">
+					<b style="color: #d9534f;">${item.item_code}</b> - ${item.warehouse}<br>
+					مطلوب: <b>${item.required}</b> | متاح: <b>${item.available}</b> | ناقص: <span style="color: red; font-weight: bold;">${item.short}</span>
+				</div>
+			`;
+		});
+		error_message += '<br>⚠️ يجب توفير المنتجات الناقصة في المخزن قبل إنشاء الفاتورة';
+
+		frappe.msgprint({
+			title: '❌ منتجات ناقصة',
+			message: error_message,
+			indicator: 'red',
+		});
+		return;
 	}
 
-	let row = locals[cdt][cdn];
-
-	if (row.item_code && row.warehouse) {
-		frappe.db
-			.get_value(
-				'Bin',
-				{
-					item_code: row.item_code,
-					warehouse: row.warehouse,
-				},
-				['projected_qty'],
-			)
-			.then((r) => {
-				if (r.message) {
-					const projected_qty = r.message.projected_qty || 0;
-					frappe.model.set_value(cdt, cdn, 'projected_qty', projected_qty);
-					refresh_field('items');
-				} else {
-					frappe.model.set_value(cdt, cdn, 'projected_qty', 0);
-					refresh_field('items');
-				}
-			});
-	} else {
-		frappe.model.set_value(cdt, cdn, 'projected_qty', 0);
-		refresh_field('items');
-	}
+	// المخزن متوفر، إنشاء الفاتورة باستخدام الطريقة القياسية
+	frappe.model.open_mapped_doc({
+		method: 'erpnext.selling.doctype.sales_order.sales_order.make_sales_invoice',
+		frm: frm,
+	});
 }
+
+// ============================================
+// التحقق من المخزن قبل إنشاء الفاتورة
+// ============================================
+function check_stock_before_invoice(frm) {
+	return new Promise((resolve) => {
+		const items_to_check = frm.doc.items
+			.map((item) => ({
+				item_code: item.item_code,
+				warehouse: item.warehouse,
+				qty: item.qty - (item.delivered_qty || 0), // Check only remaining qty
+			}))
+			.filter((item) => item.item_code && item.warehouse && item.qty > 0);
+
+		if (!items_to_check.length) {
+			resolve({ success: true });
+			return;
+		}
+
+		frappe.call({
+			method: 'frappe.client.get_list',
+			args: {
+				doctype: 'Bin',
+				filters: {
+					item_code: ['in', items_to_check.map((i) => i.item_code)],
+				},
+				fields: ['name', 'item_code', 'warehouse', 'projected_qty'],
+			},
+			callback: function (r) {
+				const bins = r.message || [];
+				const insufficient_items = [];
+
+				items_to_check.forEach((item) => {
+					const bin = bins.find(
+						(b) => b.item_code === item.item_code && b.warehouse === item.warehouse,
+					);
+					const available_qty = bin ? bin.projected_qty || 0 : 0;
+
+					if (available_qty < item.qty) {
+						insufficient_items.push({
+							item_code: item.item_code,
+							warehouse: item.warehouse,
+							required: item.qty,
+							available: available_qty,
+							short: item.qty - available_qty,
+						});
+					}
+				});
+
+				if (insufficient_items.length > 0) {
+					resolve({ success: false, insufficient_items: insufficient_items });
+				} else {
+					resolve({ success: true });
+				}
+			},
+		});
+	});
+}
+
+// ============================================
+// =======================
+// Sales Order - projected_qty field handling
+// Only color coding and click handler - NO value updates
+// =======================
 
 // ============================================
 // File 5: contract_discount.js
@@ -172,7 +293,7 @@ frappe.ui.form.on('Sales Order', {
 				})
 				.catch((err) => {
 					frappe.msgprint(__('لم يتم العثور على شركة التأمين المحددة'));
-					console.error(err);
+					console.log('[sales_order.js] method: load_insurance_company_error');
 				});
 		} else {
 			frm.set_value('custom_contract_discount', null);
@@ -579,7 +700,7 @@ frappe.ui.form.on('Sales Order', {
 				if (r.item_code && frm.doc.selling_price_list) {
 					return get_item_max_discount(r.item_code, frm.doc.selling_price_list).then(
 						(max_disc) => {
-							return get_allowed_discount_limit(max_disc).then((allowed) => {
+							return get_allowed_discount_limit(frm, max_disc).then((allowed) => {
 								if ((+r.custom_discount_percentage || 0) > allowed) {
 									r.custom_discount_percentage =
 										r._original_custom_discount_percentage || 0;
@@ -637,7 +758,7 @@ frappe.ui.form.on('Sales Order Item', {
 function sync_main_discount(frm) {
 	// ✅ If field is hidden → use employee limit directly
 	if (frm.get_field('custom__discount_percentage').df.hidden) {
-		return get_allowed_discount_limit().then((allowed) => {
+		return get_allowed_discount_limit(frm).then((allowed) => {
 			frm._original_custom__discount_percentage = allowed;
 			(frm.doc.items || []).forEach((row) => {
 				frappe.model.set_value(
@@ -652,7 +773,7 @@ function sync_main_discount(frm) {
 	}
 
 	const entered = +frm.doc.custom__discount_percentage || 0;
-	return get_allowed_discount_limit().then((allowed) => {
+	return get_allowed_discount_limit(frm).then((allowed) => {
 		if (entered > allowed) {
 			frappe.msgprint(
 				__('🚫 نسبة الخصم (الرئيسية) لا يمكن أن تتجاوز الحد ({0}%)', [allowed]),
@@ -685,7 +806,7 @@ function validate_discount_field(frm, cdt, cdn) {
 			'custom_discount_percent',
 		)
 		.then((r) =>
-			get_allowed_discount_limit(+r.message?.custom_discount_percent || 0).then(
+			get_allowed_discount_limit(frm, +r.message?.custom_discount_percent || 0).then(
 				(allowed) => {
 					if (entered > allowed) {
 						frappe.model.set_value(
@@ -709,32 +830,38 @@ function get_item_max_discount(item_code, price_list) {
 		.then((r) => +r.message?.custom_discount_percent || 0);
 }
 
-function get_allowed_discount_limit(max_discount = 0) {
-	return frappe
-		.call({
-			method: 'frappe.client.get_list',
-			args: {
-				doctype: 'Employee',
-				filters: { user_id: frappe.session.user, status: 'Active' },
-				fields: ['custom_discount_percentage_limit'],
-				limit_page_length: 1,
-			},
+function get_sales_person_employee_discount_limit(frm) {
+	const sales_person_name = frm?.doc?.custom_sales_person;
+	if (!sales_person_name) return Promise.resolve(0);
+
+	return frappe.db
+		.get_value('Sales Person', sales_person_name, 'employee')
+		.then((r) => r.message?.employee)
+		.then((employee_id) => {
+			if (!employee_id) return 0;
+			return frappe.db
+				.get_value('Employee', employee_id, 'custom_discount_percentage_limit')
+				.then((e) => +e.message?.custom_discount_percentage_limit || 0);
 		})
-		.then((res) =>
-			Math.max(max_discount, +res.message?.[0]?.custom_discount_percentage_limit || 0),
-		);
+		.catch(() => 0);
+}
+
+function get_allowed_discount_limit(frm, max_discount = 0) {
+	return get_sales_person_employee_discount_limit(frm).then((limit) =>
+		Math.max(max_discount, limit),
+	);
 }
 
 function check_main_discount(frm) {
 	// ✅ If field is hidden → use limit directly
 	if (frm.get_field('custom__discount_percentage').df.hidden) {
-		return get_allowed_discount_limit().then((allowed) => {
+		return get_allowed_discount_limit(frm).then((allowed) => {
 			frm._original_custom__discount_percentage = allowed;
 		});
 	}
 
 	const entered = +frm.doc.custom__discount_percentage || 0;
-	return get_allowed_discount_limit().then((allowed) => {
+	return get_allowed_discount_limit(frm).then((allowed) => {
 		if (entered > allowed) {
 			frappe.throw(__('🚫 نسبة الخصم (الرئيسية) لا يمكن أن تتجاوز الحد ({0}%)', [allowed]));
 		} else {
@@ -782,29 +909,14 @@ frappe.ui.form.on('Sales Order', {
 				);
 
 				const max_discount = Number(price.message?.custom_discount_percent) || 0;
-				console.log('🔍 [Discount Debug - VALIDATE] Item Price discount:', {
-					item_code: row.item_code,
-					price_list: frm.doc.selling_price_list,
-					max_discount_from_item_price: max_discount,
-					item_price_data: price.message,
-				});
 
-				// Get Employee from Sales Person instead of user_id
 				let employee_limit = 0;
 				if (frm.doc.custom_sales_person) {
-					console.log('🔍 [Discount Debug - VALIDATE] Sales Person found:', {
-						custom_sales_person: frm.doc.custom_sales_person,
-					});
 					const sales_person = await frappe.db.get_value(
 						'Sales Person',
 						frm.doc.custom_sales_person,
 						'employee',
 					);
-					console.log('🔍 [Discount Debug - VALIDATE] Sales Person data:', {
-						sales_person_name: frm.doc.custom_sales_person,
-						employee_from_sales_person: sales_person.message?.employee,
-						sales_person_data: sales_person.message,
-					});
 					if (sales_person.message?.employee) {
 						const employee = await frappe.db.get_value(
 							'Employee',
@@ -813,53 +925,11 @@ frappe.ui.form.on('Sales Order', {
 						);
 						employee_limit =
 							Number(employee.message?.custom_discount_percentage_limit) || 0;
-						console.log('🔍 [Discount Debug - VALIDATE] Employee from Sales Person:', {
-							employee_limit: employee_limit,
-							employee_data: employee.message,
-						});
 					}
-				}
-
-				// Fallback to user's employee if no sales person
-				if (!employee_limit) {
-					console.log('🔍 [Discount Debug - VALIDATE] Using fallback (user employee):', {
-						user: frappe.session.user,
-						reason: 'No employee limit from Sales Person',
-					});
-					const res = await frappe.call({
-						method: 'frappe.client.get_list',
-						args: {
-							doctype: 'Employee',
-							filters: {
-								user_id: frappe.session.user,
-								status: 'Active',
-							},
-							fields: ['custom_discount_percentage_limit'],
-							limit_page_length: 1,
-						},
-					});
-					employee_limit =
-						Number(res.message?.[0]?.custom_discount_percentage_limit) || 0;
-					console.log('🔍 [Discount Debug - VALIDATE] Fallback employee data:', {
-						employee_limit: employee_limit,
-						employee_data: res.message?.[0],
-					});
-				} else {
-					console.log(
-						'🔍 [Discount Debug - VALIDATE] Using Sales Person employee limit',
-					);
 				}
 
 				const allowed_limit = Math.max(max_discount, employee_limit);
 				const entered = Number(row.custom_discount_percentage) || 0;
-
-				console.log('🔍 [Discount Debug - VALIDATE] Final calculation:', {
-					max_discount_from_item_price: max_discount,
-					employee_limit: employee_limit,
-					allowed_limit: allowed_limit,
-					entered_discount: entered,
-					calculation: `Math.max(${max_discount}, ${employee_limit}) = ${allowed_limit}`,
-				});
 
 				if (entered > allowed_limit) {
 					let rollback_to = Number(row._original_custom_discount_percentage) || 0;
@@ -925,25 +995,11 @@ frappe.ui.form.on('Sales Order Item', {
 			)
 			.then((r) => {
 				const max_discount = Number(r.message?.custom_discount_percent) || 0;
-				console.log('🔍 [Discount Debug] Item Price discount:', {
-					item_code: row.item_code,
-					price_list: frm.doc.selling_price_list,
-					max_discount_from_item_price: max_discount,
-					item_price_data: r.message,
-				});
 
 				// Helper function to process discount validation
 				function processDiscountValidation(max_discount, employee_limit) {
 					const allowed_limit = Math.max(max_discount, employee_limit);
 					const entered = Number(row.custom_discount_percentage) || 0;
-
-					console.log('🔍 [Discount Debug] Final calculation:', {
-						max_discount_from_item_price: max_discount,
-						employee_limit: employee_limit,
-						allowed_limit: allowed_limit,
-						entered_discount: entered,
-						calculation: `Math.max(${max_discount}, ${employee_limit}) = ${allowed_limit}`,
-					});
 
 					if (entered > allowed_limit) {
 						const rollback_to = Number(row._original_custom_discount_percentage) || 0;
@@ -980,109 +1036,25 @@ frappe.ui.form.on('Sales Order Item', {
 
 				// Get Employee from Sales Person instead of user_id
 				if (frm.doc.custom_sales_person) {
-					console.log('🔍 [Discount Debug] Sales Person found:', {
-						custom_sales_person: frm.doc.custom_sales_person,
-					});
-					// First get employee from Sales Person
 					frappe.db
 						.get_value('Sales Person', frm.doc.custom_sales_person, 'employee')
 						.then((sales_person) => {
-							console.log('🔍 [Discount Debug] Sales Person data:', {
-								sales_person_name: frm.doc.custom_sales_person,
-								employee_from_sales_person: sales_person.message?.employee,
-								sales_person_data: sales_person.message,
-							});
-							if (sales_person.message?.employee) {
-								return frappe.db.get_value(
-									'Employee',
-									sales_person.message.employee,
-									'custom_discount_percentage_limit',
-								);
-							}
-							return null;
+							const employee_id = sales_person.message?.employee;
+							if (!employee_id)
+								return { message: { custom_discount_percentage_limit: 0 } };
+							return frappe.db.get_value(
+								'Employee',
+								employee_id,
+								'custom_discount_percentage_limit',
+							);
 						})
 						.then((employee) => {
-							let employee_limit = 0;
-							if (employee && employee.message?.custom_discount_percentage_limit) {
-								employee_limit =
-									Number(employee.message.custom_discount_percentage_limit) || 0;
-							}
-							console.log('🔍 [Discount Debug] Employee from Sales Person:', {
-								employee_limit: employee_limit,
-								employee_data: employee?.message,
-							});
-
-							// Fallback to user's employee if no sales person or no limit
-							if (!employee_limit) {
-								console.log(
-									'🔍 [Discount Debug] Using fallback (user employee):',
-									{
-										user: frappe.session.user,
-										reason: 'No employee limit from Sales Person',
-									},
-								);
-								frappe.call({
-									method: 'frappe.client.get_list',
-									args: {
-										doctype: 'Employee',
-										filters: {
-											user_id: frappe.session.user,
-											status: 'Active',
-										},
-										fields: ['custom_discount_percentage_limit'],
-										limit_page_length: 1,
-									},
-									callback(res) {
-										const fallback_limit =
-											Number(
-												res.message?.[0]?.custom_discount_percentage_limit,
-											) || 0;
-										console.log(
-											'🔍 [Discount Debug] Fallback employee data:',
-											{
-												fallback_limit: fallback_limit,
-												employee_data: res.message?.[0],
-											},
-										);
-										processDiscountValidation(
-											max_discount,
-											fallback_limit || employee_limit,
-										);
-									},
-								});
-							} else {
-								console.log(
-									'🔍 [Discount Debug] Using Sales Person employee limit',
-								);
-								processDiscountValidation(max_discount, employee_limit);
-							}
+							const employee_limit =
+								Number(employee?.message?.custom_discount_percentage_limit) || 0;
+							processDiscountValidation(max_discount, employee_limit);
 						});
 				} else {
-					// No sales person, use user's employee
-					console.log('🔍 [Discount Debug] No Sales Person, using user employee:', {
-						user: frappe.session.user,
-					});
-					frappe.call({
-						method: 'frappe.client.get_list',
-						args: {
-							doctype: 'Employee',
-							filters: {
-								user_id: frappe.session.user,
-								status: 'Active',
-							},
-							fields: ['custom_discount_percentage_limit'],
-							limit_page_length: 1,
-						},
-						callback(res) {
-							const employee_limit =
-								Number(res.message?.[0]?.custom_discount_percentage_limit) || 0;
-							console.log('🔍 [Discount Debug] User employee data:', {
-								employee_limit: employee_limit,
-								employee_data: res.message?.[0],
-							});
-							processDiscountValidation(max_discount, employee_limit);
-						},
-					});
+					processDiscountValidation(max_discount, 0);
 				}
 			});
 	},
@@ -1092,46 +1064,37 @@ frappe.ui.form.on('Sales Order Item', {
 	},
 });
 
-frappe.ui.form.on('Sales Order', {
-	before_load: function (frm) {
-		frm.employee = null;
-		frm.custom_sales_limit = 0;
-		frm._shown_employee_error = false; // Reset flag on each load
-	},
+async function update_sales_limit(frm) {
+	try {
+		let employee = null;
 
-	onload: async function (frm) {
-		try {
-			const { message: employees } = await frappe.call({
-				method: 'frappe.client.get_list',
-				args: {
-					doctype: 'Employee',
-					filters: {
-						user_id: frappe.session.user,
-						status: 'Active',
-					},
-					fields: ['custom_sales_limit'],
-				},
-			});
-
-			frm.employee = employees[0] || null;
-			frm.custom_sales_limit = frm.employee?.custom_sales_limit || 0;
-		} catch (error) {
-			console.error('خطأ في تحميل بيانات الموظف:', error);
-			frm.employee = null;
-			frm.custom_sales_limit = 0;
-		}
-	},
-
-	refresh: function (frm) {
-		frm.doc.items.forEach((row) => {
-			if (typeof row._original_custom_discount === 'undefined') {
-				row._original_custom_discount = row.custom_discount;
+		if (frm.doc.custom_sales_person) {
+			// Get employee from Sales Person
+			const sales_person_data = await frappe.db.get_value(
+				'Sales Person',
+				frm.doc.custom_sales_person,
+				'employee',
+			);
+			if (sales_person_data.message?.employee) {
+				const employee_data = await frappe.db.get_value(
+					'Employee',
+					sales_person_data.message.employee,
+					'custom_sales_limit',
+				);
+				employee = {
+					custom_sales_limit: employee_data.message?.custom_sales_limit || 0,
+					name: sales_person_data.message.employee,
+				};
 			}
-		});
+		} else {
+			employee = null;
+		}
 
+		frm.employee = employee;
+		frm.custom_sales_limit = employee?.custom_sales_limit || 0;
+
+		// Update field properties based on employee
 		if (!frm.employee) {
-			// Use set_df_property to set read_only for child table field
-			// Parameters: fieldname, property, value, docname (child doctype), table_field, table_row_name
 			try {
 				frm.set_df_property(
 					'items',
@@ -1144,7 +1107,6 @@ frappe.ui.form.on('Sales Order', {
 				// Field might not be loaded yet, ignore error silently
 			}
 		} else {
-			// Make field editable if employee exists
 			try {
 				frm.set_df_property(
 					'items',
@@ -1157,6 +1119,36 @@ frappe.ui.form.on('Sales Order', {
 				// Field might not be loaded yet, ignore error silently
 			}
 		}
+	} catch (error) {
+		console.log('[sales_order.js] method: load_employee_data');
+		frm.employee = null;
+		frm.custom_sales_limit = 0;
+	}
+}
+
+frappe.ui.form.on('Sales Order', {
+	before_load: function (frm) {
+		frm.employee = null;
+		frm.custom_sales_limit = 0;
+		frm._shown_employee_error = false; // Reset flag on each load
+	},
+
+	onload: async function (frm) {
+		await update_sales_limit(frm);
+	},
+
+	custom_sales_person: async function (frm) {
+		await update_sales_limit(frm);
+	},
+
+	refresh: function (frm) {
+		frm.doc.items.forEach((row) => {
+			if (typeof row._original_custom_discount === 'undefined') {
+				row._original_custom_discount = row.custom_discount;
+			}
+		});
+
+		// Field properties are already set in update_sales_limit
 	},
 });
 
@@ -1221,26 +1213,11 @@ frappe.ui.form.on('Sales Order', {
 	},
 
 	onload: async function (frm) {
-		try {
-			const { message: employees } = await frappe.call({
-				method: 'frappe.client.get_list',
-				args: {
-					doctype: 'Employee',
-					filters: {
-						user_id: frappe.session.user,
-						status: 'Active',
-					},
-					fields: ['custom_sales_limit'],
-				},
-			});
+		await update_sales_limit(frm);
+	},
 
-			frm.employee = employees[0] || null;
-			frm.custom_sales_limit = frm.employee?.custom_sales_limit || 0;
-		} catch (error) {
-			console.error('خطأ في تحميل بيانات الموظف:', error);
-			frm.employee = null;
-			frm.custom_sales_limit = 0;
-		}
+	custom_sales_person: async function (frm) {
+		await update_sales_limit(frm);
 	},
 
 	refresh: function (frm) {
@@ -2370,7 +2347,7 @@ function save_new_insurance(frm, dialog) {
 						dialog.hide();
 					},
 					error(err) {
-						console.warn('Save failed, linking to SO only', err);
+						console.log('[sales_order.js] method: save_failed_link_so');
 						frappe.msgprint({
 							title: __('تنبيه'),
 							message: __(
@@ -2427,7 +2404,7 @@ function link_insurance_to_sales_order(frm, item, field_map) {
 
 	// 2. Update Child Table
 	if (!fn || !frm.fields_dict[fn]) {
-		console.warn('Insurance child table not found on Sales Order.');
+		console.log('[sales_order.js] method: insurance_table_not_found');
 		return;
 	}
 	frm.doc[fn] = frm.doc[fn] || [];
@@ -2606,7 +2583,7 @@ frappe.ui.form.on('Sales Order Payment', {
 				}
 			} catch (e) {
 				frappe.msgprint(__('حدث خطأ أثناء جلب بيانات وضع الدفع.'));
-				console.error(e);
+				console.log('[sales_order.js] method: error_handler');
 			}
 		}
 	},
@@ -2648,7 +2625,7 @@ frappe.ui.form.on('Sales Order', {
 
 // Multi Add dialog for native items table
 function open_multi_add_dialog_for_native_table(frm) {
-	console.log('[Multi Add Native] Opening dialog', { frm: frm.doc.name });
+	console.log('[sales_order.js] method: open_multi_add_dialog_for_native_table');
 	const default_wh = frm.doc.set_warehouse || '';
 
 	const d = new frappe.ui.Dialog({
@@ -2679,10 +2656,7 @@ function open_multi_add_dialog_for_native_table(frm) {
 				frappe.msgprint({ message: __('Please select Customer first'), indicator: 'red' });
 				return;
 			}
-			console.log('[Multi Add Native] Add Selected clicked', {
-				values,
-				warehouse: values.warehouse,
-			});
+			console.log('[sales_order.js] method: multi_add_primary_action');
 			const $tbody = $(d.get_field('results').$wrapper).find('tbody');
 			let added_count = 0;
 
@@ -2691,25 +2665,17 @@ function open_multi_add_dialog_for_native_table(frm) {
 				const $r = $(this);
 				const qty = parseFloat($r.find('.multi-qty').val()) || 0;
 				const item_code = $r.attr('data-item-code');
-				console.log('[Multi Add Native] Checking row', { item_code, qty });
 
 				if (!qty || qty <= 0) {
-					console.log('[Multi Add Native] Skipping row - qty is 0 or invalid', {
-						item_code,
-						qty,
-					});
 					return;
 				}
 
 				if (!item_code) {
-					console.log('[Multi Add Native] Skipping row - no item_code', { item_code });
 					return;
 				}
 
 				rows_to_add.push({ item_code, qty, warehouse: values.warehouse || '' });
 			});
-
-			console.log('[Multi Add Native] Rows to add', rows_to_add);
 
 			// Add items to native items table
 			// Use a promise chain to ensure items are added sequentially
@@ -2717,7 +2683,7 @@ function open_multi_add_dialog_for_native_table(frm) {
 
 			rows_to_add.forEach((row_data) => {
 				promise_chain = promise_chain.then(() => {
-					console.log('[Multi Add Native] Adding row to native table', row_data);
+					console.log('[sales_order.js] method: add_row_to_native_table');
 
 					return new Promise((resolve) => {
 						// Add child row to native items table
@@ -2741,7 +2707,7 @@ function open_multi_add_dialog_for_native_table(frm) {
 			});
 
 			promise_chain.then(() => {
-				console.log('[Multi Add Native] Total rows added', added_count);
+				console.log('[sales_order.js] method: multi_add_complete');
 
 				if (added_count > 0) {
 					// Refresh the items field to show the new rows
@@ -2788,7 +2754,7 @@ function open_multi_add_dialog_for_native_table(frm) {
 
 // Search items + stock for native items table
 function search_items_with_stock_for_native(txt, warehouse, $tbody) {
-	console.log('[Search Items Native] Starting search', { txt, warehouse });
+	console.log('[sales_order.js] method: search_items_with_stock_for_native');
 	$tbody.empty();
 
 	frappe.call({
@@ -2800,12 +2766,7 @@ function search_items_with_stock_for_native(txt, warehouse, $tbody) {
 		},
 		callback(r) {
 			const results = r.results || r.message || [];
-			console.log('[Search Items Native] Search results', {
-				count: results.length,
-				results,
-			});
 			if (!results.length) {
-				console.log('[Search Items Native] No items found');
 				$tbody.append(
 					'<tr><td colspan="4" style="padding:8px;text-align:center;color:#999;">No Items Found</td></tr>',
 				);
@@ -2813,7 +2774,6 @@ function search_items_with_stock_for_native(txt, warehouse, $tbody) {
 			}
 
 			const item_codes = results.map((x) => x.value);
-			console.log('[Search Items Native] Item codes to check stock', item_codes);
 
 			frappe.call({
 				method: 'frappe.client.get_list',
@@ -2902,12 +2862,7 @@ frappe.ui.form.on('Sales Order', {
 // ============================================
 frappe.ui.form.on('Sales Order', {
 	refresh(frm) {
-		console.log(
-			'KH Quick Pay: refresh on Sales Order',
-			frm.doc.name,
-			'docstatus:',
-			frm.doc.docstatus,
-		);
+		console.log('[sales_order.js] method: kh_quick_pay_refresh');
 
 		// Only work after Submit
 		if (frm.doc.docstatus !== 1) return;
@@ -3255,7 +3210,9 @@ frappe.ui.form.on('Sales Order', {
 														frappe.msgprint(
 															`❌ فشل إرسال الرسالة إلى المورد ${supplier.name}.`,
 														);
-														console.error(err);
+														console.log(
+															'[sales_order.js] method: send_sms_to_supplier_error',
+														);
 													},
 												});
 											} else {
@@ -3303,42 +3260,6 @@ frappe.ui.form.on('Sales Order Item', {
 			// Enable reservation only if item is not subcontracted
 			frappe.model.set_value(cdt, cdn, 'reserve_stock', !is_sub);
 		});
-	},
-});
-
-// ============================================
-// File 23: reserved_qty.js
-// ============================================
-frappe.ui.form.on('Sales Order Item', {
-	item_code: function (frm, cdt, cdn) {
-		let row = locals[cdt][cdn];
-		if (row.item_code) {
-			frappe.call({
-				method: 'frappe.client.get_value',
-				args: {
-					doctype: 'Bin',
-					filters: {
-						item_code: row.item_code,
-						warehouse: row.warehouse,
-					},
-					fieldname: 'reserved_qty',
-				},
-				callback: function (r) {
-					if (r.message) {
-						frappe.model.set_value(
-							cdt,
-							cdn,
-							'custom_reserved_qty',
-							r.message.reserved_qty || 0,
-						);
-					} else {
-						frappe.model.set_value(cdt, cdn, 'custom_reserved_qty', 0);
-					}
-				},
-			});
-		} else {
-			frappe.model.set_value(cdt, cdn, 'custom_reserved_qty', 0);
-		}
 	},
 });
 
@@ -3618,7 +3539,7 @@ frappe.ui.form.on('Sales Order', {
 				}
 			}
 		} catch (error) {
-			console.error('Error in insurance calculation:', error);
+			console.log('[sales_order.js] method: insurance_calculation');
 			await recalculate_insurance_amounts_v2(frm);
 		}
 
@@ -3687,7 +3608,7 @@ frappe.ui.form.on('Sales Order', {
 				}
 			}
 		} catch (error) {
-			console.error('Error in before_save:', error);
+			console.log('[sales_order.js] method: before_save');
 			await recalculate_insurance_amounts_v2(frm);
 		}
 	},
@@ -3719,21 +3640,7 @@ frappe.ui.form.on('Sales Order', {
 				const max_discount = +item_price.message?.custom_discount_percent || 0;
 
 				// Get employee discount limit
-				const employee_res = await frappe.call({
-					method: 'frappe.client.get_list',
-					args: {
-						doctype: 'Employee',
-						filters: {
-							user_id: frappe.session.user,
-							status: 'Active',
-						},
-						fields: ['custom_discount_percentage_limit'],
-						limit_page_length: 1,
-					},
-				});
-
-				const employee_limit =
-					+employee_res.message?.[0]?.custom_discount_percentage_limit || 0;
+				const employee_limit = await get_sales_person_employee_discount_limit(frm);
 				const allowed_limit = Math.max(max_discount, employee_limit);
 
 				// Check if entered discount exceeds allowed limit
@@ -3747,7 +3654,7 @@ frappe.ui.form.on('Sales Order', {
 					};
 				}
 			} catch (error) {
-				console.error('Error validating discount for item:', row.item_code, error);
+				console.log('[sales_order.js] method: validate_discount');
 			}
 
 			return null;
@@ -3945,33 +3852,8 @@ frappe.ui.form.on('Sales Order', {
 						let customer_doc = response.message;
 						let existing_rows = customer_doc.custom_size_t || [];
 						let updated_rows = [...existing_rows];
-						let conflict_found = false;
 
 						for (let so_row of frm.doc.custom_size) {
-							// Ignore conflict if row date equals search date
-							let is_from_search =
-								frm.doc.custom_date && so_row.date === frm.doc.custom_date;
-
-							if (!is_from_search) {
-								let conflict = existing_rows.some(
-									(row) => row.date === so_row.date && row.so !== frm.doc.name,
-								);
-
-								if (conflict) {
-									frappe.msgprint({
-										title: __('⚠️ تنبيه'),
-										message:
-											__(' 📝 ') +
-											so_row.date +
-											__(' هذا الكشف موجود مسبقاً '),
-										indicator: 'red',
-									});
-									frappe.validated = false;
-									conflict_found = true;
-									break; // Stop iteration
-								}
-							}
-
 							let row_data = {
 								date: so_row.date,
 								sphr: so_row.sphr,
@@ -4001,19 +3883,16 @@ frappe.ui.form.on('Sales Order', {
 							}
 						}
 
-						// If no conflict, save to customer record
-						if (!conflict_found) {
-							return frappe.call({
-								method: 'frappe.client.set_value',
-								args: {
-									doctype: 'Customer',
-									name: frm.doc.customer,
-									fieldname: {
-										custom_size_t: updated_rows,
-									},
+						return frappe.call({
+							method: 'frappe.client.set_value',
+							args: {
+								doctype: 'Customer',
+								name: frm.doc.customer,
+								fieldname: {
+									custom_size_t: updated_rows,
 								},
-							});
-						}
+							},
+						});
 					}
 				});
 		}
@@ -4166,7 +4045,7 @@ frappe.ui.form.on('Sales Order', {
 											frappe.msgprint(
 												'❌ فشل إرسال الرسالة. تحقق من إعدادات SMS.',
 											);
-											console.error(err);
+											console.log('[sales_order.js] method: send_sms_error');
 										},
 									});
 								});
@@ -4348,7 +4227,7 @@ frappe.ui.form.on('Sales Order', {
 			// Refresh form to get latest changes
 			await frm.refresh();
 		} catch (error) {
-			console.error('Error in after_save:', error);
+			console.log('[sales_order.js] method: after_save');
 			frappe.msgprint({
 				title: __('خطأ'),
 				indicator: 'red',
@@ -4411,6 +4290,16 @@ function init_strict_colors(frm) {
 }
 
 // =======================
+// Frappe form event handler for projected_qty field
+// =======================
+frappe.ui.form.on('Sales Order Item', {
+	projected_qty: function (frm, cdt, cdn) {
+		// This handler is called when projected_qty field is focused or edited
+		// We'll make it clickable to open the dialog
+	},
+});
+
+// =======================
 // Apply strict colors to all grid rows
 // Iterates through all existing rows and applies color coding
 // =======================
@@ -4434,7 +4323,8 @@ function color_single_row(grid_row) {
 	if (!grid_row || !grid_row.doc) return;
 
 	const row = grid_row.doc;
-	const $actual = $(grid_row.row).find('[data-fieldname="projected_qty"]');
+	const $cell = $(grid_row.row).find('[data-fieldname="projected_qty"]');
+	const $input = $cell.find('input');
 
 	if (!row.item_code || !row.warehouse) return;
 	if (!cur_frm || !cur_frm.doc || !cur_frm.doc.items) return;
@@ -4445,6 +4335,32 @@ function color_single_row(grid_row) {
 
 	const available_in_wh = row.projected_qty || 0;
 
+	// Style the cell and input as clickable
+	$cell.css('cursor', 'pointer');
+	$input.css('cursor', 'pointer');
+
+	// Remove previous click handlers to avoid duplicates
+	$cell.off('click.openStockDialog');
+	$input.off('click.openStockDialog');
+
+	// Attach click handler to BOTH cell and input
+	$cell.on('click.openStockDialog', function (e) {
+		e.preventDefault();
+		e.stopPropagation();
+		if (row.item_code) {
+			open_stock_dialog(cur_frm, grid_row);
+		}
+	});
+
+	$input.on('click.openStockDialog', function (e) {
+		e.preventDefault();
+		e.stopPropagation();
+		if (row.item_code) {
+			open_stock_dialog(cur_frm, grid_row);
+		}
+	});
+
+	// Fetch stock data for color coding (non-blocking)
 	frappe.call({
 		method: 'frappe.client.get_list',
 		args: { doctype: 'Bin', filters: { item_code: row.item_code }, fields: ['projected_qty'] },
@@ -4452,28 +4368,18 @@ function color_single_row(grid_row) {
 			const bins = r.message || [];
 			const total_available = bins.reduce((sum, b) => sum + (b.projected_qty || 0), 0);
 
-			$actual.removeClass('strict-red strict-green strict-yellow');
+			$cell.removeClass('strict-red strict-green strict-yellow');
 			let tooltip = `إجمالي المطلوب: ${total_required_qty}\nمتاح بالمخزن: ${available_in_wh}\nإجمالي بالشركة: ${total_available}`;
 
-			if (total_required_qty <= available_in_wh) $actual.addClass('strict-green');
+			if (total_required_qty <= available_in_wh) $cell.addClass('strict-green');
 			else if (total_required_qty > available_in_wh && total_available >= total_required_qty)
-				$actual.addClass('strict-yellow');
+				$cell.addClass('strict-yellow');
 			else {
-				$actual.addClass('strict-red');
+				$cell.addClass('strict-red');
 				tooltip = 'الصنف غير متوفر بالشركة';
 			}
 
-			$actual.attr('title', tooltip);
-			$actual.css('cursor', 'pointer');
-
-			$actual.off('click.stockDialog').on('click.stockDialog', function () {
-				if (grid_row._dialog_opened) return;
-				grid_row._dialog_opened = true;
-				open_stock_dialog(cur_frm, grid_row);
-				frappe.after_ajax(() => {
-					setTimeout(() => (grid_row._dialog_opened = false), 500);
-				});
-			});
+			$cell.attr('title', tooltip);
 		},
 	});
 }
@@ -4497,7 +4403,7 @@ function inject_strict_css() {
 
 // =======================
 // Open stock dialog showing warehouse balances
-// Displays available stock in all warehouses for the selected item
+// Displays available stock for sale (actual_qty - reserved_qty) in all warehouses for the selected item
 // Works in any document status (draft, submitted, cancelled)
 // =======================
 function open_stock_dialog(frm, grid_row) {
@@ -4512,7 +4418,7 @@ function open_stock_dialog(frm, grid_row) {
 		args: {
 			doctype: 'Bin',
 			filters: { item_code: row.item_code },
-			fields: ['warehouse', 'projected_qty'],
+			fields: ['warehouse', 'actual_qty', 'reserved_qty'],
 			order_by: 'warehouse',
 		},
 		callback: function (r) {
@@ -4530,9 +4436,11 @@ function open_stock_dialog(frm, grid_row) {
 			let rows_html = list
 				.map((d) => {
 					const wh = frappe.utils.escape_html(d.warehouse || '');
-					const projected_qty = d.projected_qty || 0;
-					total += projected_qty;
-					const qty_style = projected_qty <= 0 ? ' style="color:red;"' : '';
+					const actual_qty = d.actual_qty || 0;
+					const reserved_qty = d.reserved_qty || 0;
+					const available_qty = actual_qty - reserved_qty;
+					total += available_qty;
+					const qty_style = available_qty <= 0 ? ' style="color:red;"' : '';
 
 					let stock_entry_cell = '-';
 					if (row.custom_stock_entry && row.custom_stock_entry.trim() !== '') {
@@ -4553,7 +4461,7 @@ function open_stock_dialog(frm, grid_row) {
 
 					return `<tr data-warehouse="${wh}">
                             <td>${wh}</td>
-                            <td${qty_style}>${projected_qty}</td>
+                            <td${qty_style}>${available_qty}</td>
                             <td class="stock-entry-no">${stock_entry_cell}</td>
                             <td>${action_btn}</td>
                         </tr>`;
@@ -4593,6 +4501,12 @@ function open_stock_dialog(frm, grid_row) {
 				const wh = $(this).attr('data-warehouse');
 				const row_current = frappe.get_doc(row.doctype, row.name);
 
+				// Check if Sales Order is submitted
+				if (frm.doc.docstatus === 1) {
+					frappe.msgprint(__('أمر البيع تم الحفظ. لا يمكن إنشاء قيد مخزني.'));
+					return;
+				}
+
 				// Check if order is linked to quotation and stock entry not created yet
 				if (row_current.prevdoc_docname && !row_current.custom_stock_entry) {
 					frappe.msgprint(
@@ -4617,9 +4531,11 @@ function open_stock_dialog(frm, grid_row) {
 				}
 
 				const bin_data = list.find((d) => d.warehouse === wh);
-				const projected_qty = bin_data?.projected_qty || 0;
+				const actual_qty = bin_data?.actual_qty || 0;
+				const reserved_qty = bin_data?.reserved_qty || 0;
+				const available_qty = actual_qty - reserved_qty;
 
-				if (projected_qty <= 0) frappe.msgprint(__('الرصيد غير كافي لإنشاء قيد مخزني'));
+				if (available_qty <= 0) frappe.msgprint(__('الرصيد غير كافي لإنشاء قيد مخزني'));
 				else create_stock_entry(frm, row_current, wh, d);
 			});
 
@@ -5351,7 +5267,7 @@ function save_new_exam(frm, dialog) {
 			}
 		},
 		error(err) {
-			console.error('Error saving exam on customer', err);
+			console.log('[sales_order.js] method: save_exam_error');
 			frappe.msgprint({
 				title: __('خطأ'),
 				message: __('تعذر حفظ الكشف في ملف العميل (ربما مشكلة صلاحيات).'),
@@ -5370,7 +5286,7 @@ function link_exam_to_sales_order_child(frm, exam, field_map) {
 	const fn = ORDER_EXAMS_CHILD_FIELD;
 	if (!fn || !frm.fields_dict[fn]) {
 		// مفيش جدول child فى أمر البيع أو الاسم مش مظبوط → نتجاهل
-		console.warn('Eye Prescription child table not found on Sales Order, skipping link.');
+		console.log('[sales_order.js] method: eye_prescription_table_not_found');
 		return;
 	}
 
@@ -5566,7 +5482,7 @@ function load_previous_eye_exams(frm, dialog) {
 			});
 		},
 		error(err) {
-			console.error('Error loading previous eye exams', err);
+			console.log('[sales_order.js] method: load_exams_error');
 			wrapper.html(`
                 <div class="text-danger small">
                     تعذر تحميل الكشوفات السابقة (صلاحيات أو مشكلة في الاتصال).
@@ -5630,4 +5546,229 @@ function force_if_invalid(frm, allowed, fallback) {
 	if (!current || !allowed.includes(current)) {
 		frm.set_value('order_type', fallback);
 	}
+}
+
+// ============================================
+// إنشاء طلب شراء (عدسات فقط)
+// ============================================
+async function open_lens_po_dialog(frm) {
+	const so_items = frm.doc.items || [];
+
+	// ✅ المخزن الرئيسي من Sales Order
+	const so_wh = frm.doc.set_warehouse || '';
+	if (!so_wh) {
+		frappe.msgprint(__('لا يوجد مخزن محدد في Sales Order (set_warehouse). حدده أولاً.'));
+		return;
+	}
+
+	const rows = [];
+
+	for (const r of so_items) {
+		if (!r.item_code) continue;
+
+		const item_group = await frappe.db
+			.get_value('Item', r.item_code, 'item_group')
+			.then((res) => res.message?.item_group || '')
+			.catch(() => '');
+
+		// ✅ contains: أي حاجة فيها Eyeglasses Lens
+		if (!item_group.includes('Eyeglasses Lens')) continue;
+
+		const pending = r.pending_qty != null ? r.pending_qty || 0 : r.qty || 0;
+		if (pending <= 0) continue;
+
+		rows.push({
+			__checked: 1,
+			so_detail: r.name,
+			item_code: r.item_code,
+			item_name: r.item_name,
+			item_group: item_group,
+			pending_qty: pending,
+			qty: pending,
+			warehouse: so_wh, // ✅ ثابت من set_warehouse
+		});
+	}
+
+	if (!rows.length) {
+		frappe.msgprint(__('لا توجد أصناف مسموح بها (Item Group يحتوي على "Eyeglasses Lens").'));
+		return;
+	}
+
+	const d = new frappe.ui.Dialog({
+		title: __('Select Items (Lens Only)'),
+		size: 'large',
+		fields: [
+			// ✅ Supplier عام
+			{
+				fieldname: 'supplier',
+				fieldtype: 'Link',
+				options: 'Supplier',
+				label: __('Supplier'),
+				reqd: 1,
+			},
+
+			// ✅ عرض المخزن الرئيسي فقط (للتأكيد)
+			{
+				fieldname: 'set_warehouse_view',
+				fieldtype: 'Link',
+				options: 'Warehouse',
+				label: __('Warehouse (from SO set_warehouse)'),
+				read_only: 1,
+				default: so_wh,
+			},
+
+			{
+				fieldname: 'auto_submit',
+				fieldtype: 'Check',
+				label: __('Auto Submit PO'),
+				default: 0,
+			},
+
+			{
+				fieldname: 'items',
+				fieldtype: 'Table',
+				label: __('Items'),
+				in_place_edit: true,
+				cannot_add_rows: true,
+				data: rows,
+				fields: [
+					{ fieldname: '__checked', fieldtype: 'Check', label: '', in_list_view: 1 },
+					{
+						fieldname: 'item_code',
+						fieldtype: 'Data',
+						label: 'Item',
+						read_only: 1,
+						in_list_view: 1,
+					},
+					{
+						fieldname: 'item_name',
+						fieldtype: 'Data',
+						label: 'Item name',
+						read_only: 1,
+						in_list_view: 1,
+					},
+					{
+						fieldname: 'item_group',
+						fieldtype: 'Data',
+						label: 'Item Group',
+						read_only: 1,
+						in_list_view: 1,
+					},
+					{
+						fieldname: 'pending_qty',
+						fieldtype: 'Float',
+						label: 'Pending Qty',
+						read_only: 1,
+						in_list_view: 1,
+					},
+					{
+						fieldname: 'qty',
+						fieldtype: 'Float',
+						label: 'PO Qty',
+						reqd: 1,
+						in_list_view: 1,
+					},
+
+					// ✅ عرض مخزن السطر (هو نفس set_warehouse)
+					{
+						fieldname: 'warehouse',
+						fieldtype: 'Link',
+						options: 'Warehouse',
+						label: 'Warehouse',
+						read_only: 1,
+						in_list_view: 1,
+					},
+				],
+			},
+		],
+		primary_action_label: __('Create Purchase Order'),
+		primary_action: async () => {
+			const values = d.get_values();
+			if (!values) return;
+
+			const supplier = values.supplier;
+			const table = d.fields_dict.items.grid.data || [];
+
+			const selected = table
+				.filter((r) => r.__checked && (r.qty || 0) > 0)
+				.map((r) => ({
+					so_detail: r.so_detail,
+					item_code: r.item_code,
+					qty: r.qty,
+				}));
+
+			if (!selected.length) {
+				frappe.msgprint(__('اختر صنف واحد على الأقل وحدد الكمية.'));
+				return;
+			}
+
+			try {
+				frappe.dom.freeze(__('Creating Purchase Order...'));
+
+				const po_items = [];
+				for (const it of selected) {
+					const soRow = (frm.doc.items || []).find((r) => r.name === it.so_detail);
+
+					po_items.push({
+						item_code: it.item_code,
+						qty: it.qty,
+						// ✅ مخزن السطر = set_warehouse
+						warehouse: so_wh,
+						uom: soRow?.uom,
+						schedule_date: soRow?.delivery_date || frm.doc.transaction_date,
+						rate: soRow?.rate || 0,
+						sales_order: frm.doc.name,
+						sales_order_item: it.so_detail,
+					});
+				}
+
+				const po_doc = {
+					doctype: 'Purchase Order',
+					company: frm.doc.company,
+					supplier: supplier,
+					schedule_date: frm.doc.transaction_date,
+
+					// ✅ مخزن الهيدر في Purchase Order = نفس set_warehouse
+					set_warehouse: so_wh,
+
+					items: po_items,
+				};
+
+				const ins = await frappe.call({
+					method: 'frappe.client.insert',
+					args: { doc: po_doc },
+				});
+
+				const po_name = ins.message?.name;
+
+				if (values.auto_submit && po_name) {
+					await frappe.call({
+						method: 'frappe.client.submit',
+						args: { doc: { doctype: 'Purchase Order', name: po_name } },
+					});
+				}
+
+				d.hide();
+
+				frappe.msgprint({
+					title: __('Purchase Order Created'),
+					message: po_name
+						? `✅ تم إنشاء طلب الشراء: <a href="/app/purchase-order/${po_name}" target="_blank">${po_name}</a><br>
+               (Warehouse = ${so_wh} من set_warehouse)`
+						: __('تم الإنشاء لكن لم أستطع قراءة رقم المستند.'),
+				});
+			} catch (e) {
+				console.log('[sales_order.js] method: error_handler');
+				frappe.msgprint(
+					__(
+						'لو ظهرت رسالة صلاحيات: لازم المستخدم يكون عنده صلاحية إنشاء Purchase Order (Purchase User).',
+					),
+				);
+			} finally {
+				frappe.dom.unfreeze();
+			}
+		},
+	});
+
+	d.show();
 }
