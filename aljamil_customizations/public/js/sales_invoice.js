@@ -100,26 +100,23 @@ function open_quick_payment_dialog_for_so(frm) {
 				pe.paid_amount = pay_amount;
 				pe.received_amount = pay_amount;
 
-				// 6. Get default account from Mode of Payment for the company
 				await new Promise((resolve, reject) => {
 					frappe.call({
-						method: 'frappe.client.get_value',
+						method: 'erpnext.accounts.doctype.sales_invoice.sales_invoice.get_bank_cash_account',
 						args: {
-							doctype: 'Mode of Payment Account',
-							filters: {
-								parent: values.mode_of_payment,
-								company: frm.doc.company,
-							},
-							fieldname: 'default_account',
+							mode_of_payment: values.mode_of_payment,
+							company: frm.doc.company,
 						},
 						callback: function (r) {
-							if (r.message && r.message.default_account) {
+							if (r.message && r.message.account) {
 								let payment_account_field =
 									pe.payment_type == 'Receive' ? 'paid_to' : 'paid_from';
-								pe[payment_account_field] = r.message.default_account;
+								pe[payment_account_field] = r.message.account;
 								resolve();
 							} else {
-								reject(new Error('لم يتم العثور على حساب افتراضي لطريقة الدفع'));
+								reject(
+									new Error('لم يتم العثور على حساب افتراضي لطريقة الدفع لهذه الشركة'),
+								);
 							}
 						},
 					});
