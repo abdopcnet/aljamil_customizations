@@ -91,7 +91,7 @@ function check_sales_invoice_stock(frm) {
 			filters: {
 				item_code: ['in', items_to_check.map((i) => i.item_code)],
 			},
-			fields: ['name', 'item_code', 'warehouse', 'projected_qty'],
+			fields: ['name', 'item_code', 'warehouse', 'actual_qty'],
 		},
 		async: false,
 		callback: function (r) {
@@ -104,7 +104,7 @@ function check_sales_invoice_stock(frm) {
 					(b) => b.item_code === item.item_code && b.warehouse === item.warehouse,
 				);
 
-				const available_qty = bin ? bin.projected_qty || 0 : 0;
+				const available_qty = bin ? bin.actual_qty || 0 : 0;
 
 				// التحقق من توفر الكمية
 				if (available_qty < item.qty) {
@@ -160,8 +160,7 @@ frappe.ui.form.on('Sales Order', {
 
 		// عرض الأزرار فقط لأوامر البيع المحفوظة
 		if (frm.doc.docstatus === 1) {
-			// إزالة زر "فاتورة البيع" الافتراضي من قائمة الإنشاء
-			frm.page.clear_inner_toolbar();
+			// لا نمسح شريط الأدوات الداخلي افتراضياً لكي تبقى الأزرار الافتراضية مرئية
 
 			// إضافة زر "إنشاء فاتورة بيع" مخصص (مستقل)
 			frm.add_custom_button(__('إنشاء فاتورة بيع'), () => {
@@ -169,7 +168,7 @@ frappe.ui.form.on('Sales Order', {
 			}).addClass('btn-primary');
 
 			// إضافة زر "إنشاء طلب شراء (عدسات فقط)" (مستقل)
-			frm.add_custom_button(__('إنشاء طلب شراء (عدسات فقط)'), () => {
+			frm.add_custom_button(__(' طلب شراء (عدسات فقط)'), () => {
 				open_lens_po_dialog(frm);
 			});
 		}
@@ -236,7 +235,7 @@ function check_stock_before_invoice(frm) {
 				filters: {
 					item_code: ['in', items_to_check.map((i) => i.item_code)],
 				},
-				fields: ['name', 'item_code', 'warehouse', 'projected_qty'],
+				fields: ['name', 'item_code', 'warehouse', 'actual_qty'],
 			},
 			callback: function (r) {
 				const bins = r.message || [];
@@ -246,7 +245,7 @@ function check_stock_before_invoice(frm) {
 					const bin = bins.find(
 						(b) => b.item_code === item.item_code && b.warehouse === item.warehouse,
 					);
-					const available_qty = bin ? bin.projected_qty || 0 : 0;
+					const available_qty = bin ? bin.actual_qty || 0 : 0;
 
 					if (available_qty < item.qty) {
 						insufficient_items.push({
@@ -575,21 +574,17 @@ frappe.ui.form.on('Sales Order', {
 	},
 
 	after_save(frm) {
-		let updated = false;
-
+		// Sync originals in-memory only to avoid triggering another save.
+		// Generation of codes is already handled when the field is changed,
+		// so we don't force an extra save here.
 		frm.doc.items.forEach((row) => {
 			if (!row._original_custom_discount2 && row.custom_discount2 > 0) {
 				row._original_custom_discount2 = row.custom_discount2;
-
 				if (!row.custom_discount_code) {
 					row.custom_discount_code = generateRandomCode(10);
 				}
-
-				updated = true;
 			}
 		});
-
-		if (updated) frm.save();
 	},
 
 	validate(frm) {
@@ -951,14 +946,12 @@ frappe.ui.form.on('Sales Order', {
 	},
 
 	after_save(frm) {
-		let updated = false;
+		// Sync original discount percentage in-memory only to avoid forcing another save.
 		frm.doc.items.forEach((row) => {
 			if (!row._original_custom_discount_percentage && row.custom_discount_percentage > 0) {
 				row._original_custom_discount_percentage = row.custom_discount_percentage;
-				updated = true;
 			}
 		});
-		if (updated) frm.save();
 	},
 });
 
@@ -1706,11 +1699,11 @@ const INSURANCE_FIELDNAMES = {
 
 frappe.ui.form.on('Sales Order', {
 	refresh(frm) {
-		if (frm.page.insurance_btn && !frm.page.insurance_btn.is_destroyed) {
-			frm.page.insurance_btn.remove();
+		if (frm.insurance_btn) {
+			frm.insurance_btn.remove();
+			frm.insurance_btn = null;
 		}
-		frm.page.insurance_btn = frm.page
-			.add_inner_button(__('بيانات التأمين (Insurance Data)'), function () {
+		frm.insurance_btn = frm.add_custom_button(__('بيانات التأمين (Insurance Data)'), function () {
 				// 1. التحقق من نوع الأمر
 				const type = frm.doc.order_type || frm.doc.custom_order_type;
 				if (type !== 'Insurance') {
@@ -1732,8 +1725,7 @@ frappe.ui.form.on('Sales Order', {
 					return;
 				}
 				open_insurance_dialog(frm);
-			})
-			.addClass('btn-info');
+			}).addClass('btn-info');
 	},
 });
 
@@ -3113,137 +3105,137 @@ frappe.ui.form.on('Sales Order Item', {
 // ============================================
 // File 21: request_for_quotation.js
 // ============================================
-frappe.ui.form.on('Sales Order', {
-	on_submit: function (frm) {
-		if (!frm.doc.branch) {
-			frappe.throw('⚠️ يجب تحديد الفرع في أمر البيع.');
-		}
-
-		frappe.db
-			.get_list('Supplier', {
-				filters: { custom_branch: frm.doc.branch },
-				fields: ['name', 'supplier_primary_contact'], // Get primary Contact
-			})
-			.then((suppliers) => {
-				if (!suppliers || suppliers.length === 0) {
-					frappe.throw(`❌ لا يوجد موردون مرتبطون بالفرع: ${frm.doc.branch}`);
-				}
-
-				suppliers.forEach((supplier) => {
-					if (!supplier.name) return;
-
-					let rfq = {
-						doctype: 'Request for Quotation',
-						supplier: supplier.name,
-						transaction_date: frappe.datetime.get_today(),
-						schedule_date: frappe.datetime.add_days(frappe.datetime.get_today(), 7),
-						company: frm.doc.company,
-						title: `طلب عرض سعر - ${supplier.name}`,
-						message_for_supplier: 'نرجو تزويدنا بعرض السعر في أقرب وقت',
-						suppliers: [{ supplier: supplier.name }],
-						items: [],
-					};
-
-					(frm.doc.items || []).forEach((item) => {
-						if (item.item_code && item.qty) {
-							rfq.items.push({
-								item_code: item.item_code,
-								qty: item.qty,
-								warehouse: item.warehouse,
-								uom: item.uom || 'Nos',
-								conversion_factor: 1,
-							});
-						}
-					});
-
-					if (rfq.items.length === 0) {
-						frappe.msgprint(
-							`⚠️ لم يتم إنشاء طلب عرض سعر للمورد ${supplier.name} لعدم وجود أصناف.`,
-						);
-						return;
-					}
-
-					// Create RFQ
-					frappe.call({
-						method: 'frappe.client.insert',
-						args: { doc: rfq },
-						callback: function (res) {
-							if (res.message) {
-								let rfq_link = `${window.location.origin}/app/request-for-quotation/${res.message.name}`;
-								frappe.msgprint({
-									title: '✅ تم إنشاء طلب عرض سعر',
-									message: `المورد: <b>${supplier.name}</b><br>رابط: <a href="${rfq_link}" target="_blank">${res.message.name}</a>`,
-									indicator: 'green',
-								});
-
-								// Get phone number from Contact linked to supplier
-								if (supplier.supplier_primary_contact) {
-									frappe.db
-										.get_doc('Contact', supplier.supplier_primary_contact)
-										.then((contact_doc) => {
-											let phone_number = null;
-
-											// Search in phone_nos table for first available number
-											if (
-												contact_doc.phone_nos &&
-												contact_doc.phone_nos.length > 0
-											) {
-												phone_number = contact_doc.phone_nos[0].phone;
-											}
-
-											if (phone_number) {
-												let sms_message =
-													`📌 تم إنشاء طلب عرض سعر جديد (${res.message.name})\n` +
-													`الرابط: ${rfq_link}`;
-												frappe.call({
-													method: 'frappe.core.doctype.sms_settings.sms_settings.send_sms',
-													args: {
-														receiver_list: [phone_number],
-														msg: sms_message,
-													},
-													callback: function () {
-														frappe.msgprint(
-															`📨 تم إرسال رابط RFQ إلى المورد ${supplier.name} (${phone_number})`,
-														);
-													},
-													error: function (err) {
-														frappe.msgprint(
-															`❌ فشل إرسال الرسالة إلى المورد ${supplier.name}.`,
-														);
-														console.log(
-															'[sales_order.js] method: send_sms_to_supplier_error',
-														);
-													},
-												});
-											} else {
-												frappe.msgprint(
-													`⚠️ لا يوجد رقم هاتف في Contact: ${supplier.supplier_primary_contact} للمورد ${supplier.name}.`,
-												);
-											}
-										});
-								} else {
-									frappe.msgprint(
-										`⚠️ لا يوجد Contact أساسي للمورد ${supplier.name}.`,
-									);
-								}
-							}
-						},
-						error: function (err) {
-							frappe.msgprint({
-								title: '❌ فشل إنشاء طلب عرض سعر',
-								message: `المورد: ${supplier.name}<br><pre>${JSON.stringify(
-									err,
-									null,
-									2,
-								)}</pre>`,
-								indicator: 'red',
-							});
-						},
-					});
-				});
-			});
-	},
-});
+//frappe.ui.form.on('Sales Order', {
+//	on_submit: function (frm) {
+//		if (!frm.doc.branch) {
+//			frappe.throw('⚠️ يجب تحديد الفرع في أمر البيع.');
+//		}
+//
+//		frappe.db
+//			.get_list('Supplier', {
+//				filters: { custom_branch: frm.doc.branch },
+//				fields: ['name', 'supplier_primary_contact'], // Get primary Contact
+//			})
+//			.then((suppliers) => {
+//				if (!suppliers || suppliers.length === 0) {
+//					frappe.throw(`❌ لا يوجد موردون مرتبطون بالفرع: ${frm.doc.branch}`);
+//				}
+//
+//				suppliers.forEach((supplier) => {
+//					if (!supplier.name) return;
+//
+//					let rfq = {
+//						doctype: 'Request for Quotation',
+//						supplier: supplier.name,
+//						transaction_date: frappe.datetime.get_today(),
+//						schedule_date: frappe.datetime.add_days(frappe.datetime.get_today(), 7),
+//						company: frm.doc.company,
+//						title: `طلب عرض سعر - ${supplier.name}`,
+//						message_for_supplier: 'نرجو تزويدنا بعرض السعر في أقرب وقت',
+//						suppliers: [{ supplier: supplier.name }],
+//						items: [],
+//					};
+//
+//					(frm.doc.items || []).forEach((item) => {
+//						if (item.item_code && item.qty) {
+//							rfq.items.push({
+//								item_code: item.item_code,
+//								qty: item.qty,
+//								warehouse: item.warehouse,
+//								uom: item.uom || 'Nos',
+//								conversion_factor: 1,
+//							});
+//						}
+//					});
+//
+//					if (rfq.items.length === 0) {
+//						frappe.msgprint(
+//							`⚠️ لم يتم إنشاء طلب عرض سعر للمورد ${supplier.name} لعدم وجود أصناف.`,
+//						);
+//						return;
+//					}
+//
+//					// Create RFQ
+//					frappe.call({
+//						method: 'frappe.client.insert',
+//						args: { doc: rfq },
+//						callback: function (res) {
+//							if (res.message) {
+//								let rfq_link = `${window.location.origin}/app/request-for-quotation/${res.message.name}`;
+//								frappe.msgprint({
+//									title: '✅ تم إنشاء طلب عرض سعر',
+//									message: `المورد: <b>${supplier.name}</b><br>رابط: <a href="${rfq_link}" target="_blank">${res.message.name}</a>`,
+//									indicator: 'green',
+//								});
+//
+//								// Get phone number from Contact linked to supplier
+//								if (supplier.supplier_primary_contact) {
+//									frappe.db
+//										.get_doc('Contact', supplier.supplier_primary_contact)
+//										.then((contact_doc) => {
+//											let phone_number = null;
+//
+//											// Search in phone_nos table for first available number
+//											if (
+//												contact_doc.phone_nos &&
+//												contact_doc.phone_nos.length > 0
+//											) {
+//												phone_number = contact_doc.phone_nos[0].phone;
+//											}
+//
+//											if (phone_number) {
+//												let sms_message =
+//													`📌 تم إنشاء طلب عرض سعر جديد (${res.message.name})\n` +
+//													`الرابط: ${rfq_link}`;
+//												frappe.call({
+//													method: 'frappe.core.doctype.sms_settings.sms_settings.send_sms',
+//													args: {
+//														receiver_list: [phone_number],
+//														msg: sms_message,
+//													},
+//													callback: function () {
+//														frappe.msgprint(
+//															`📨 تم إرسال رابط RFQ إلى المورد ${supplier.name} (${phone_number})`,
+//														);
+//													},
+//													error: function (err) {
+//														frappe.msgprint(
+//															`❌ فشل إرسال الرسالة إلى المورد ${supplier.name}.`,
+//														);
+//														console.log(
+//															'[sales_order.js] method: send_sms_to_supplier_error',
+//														);
+//													},
+//												});
+//											} else {
+//												frappe.msgprint(
+//													`⚠️ لا يوجد رقم هاتف في Contact: ${supplier.supplier_primary_contact} للمورد ${supplier.name}.`,
+//												);
+//											}
+//										});
+//								} else {
+//									frappe.msgprint(
+//										`⚠️ لا يوجد Contact أساسي للمورد ${supplier.name}.`,
+//									);
+//								}
+//							}
+//						},
+//						error: function (err) {
+//							frappe.msgprint({
+//								title: '❌ فشل إنشاء طلب عرض سعر',
+//								message: `المورد: ${supplier.name}<br><pre>${JSON.stringify(
+//									err,
+//									null,
+//									2,
+//								)}</pre>`,
+//								indicator: 'red',
+//							});
+//						},
+//					});
+//				});
+//			});
+//	},
+//});
 
 // ============================================
 // File 22: reservation.js
@@ -4652,6 +4644,46 @@ function create_stock_entry(frm, row, from_warehouse, dialog) {
 frappe.ui.form.on('Sales Order Item', {
 	item_code: function (frm, cdt, cdn) {
 		setTimeout(() => apply_strict_colors(frm), 200);
+
+		// Recalculate row totals after item change. Price may be populated
+		// asynchronously by other handlers, so wait briefly before recalculating.
+		setTimeout(() => {
+			try {
+				recalc_row_and_total(frm, cdt, cdn);
+				// Clear any leftover per-row custom discount fields when item changes
+				try {
+					const row = locals[cdt] && locals[cdt][cdn];
+					if (row) {
+						frappe.model.set_value(cdt, cdn, 'custom_discount', 0);
+						frappe.model.set_value(cdt, cdn, 'custom_discount_percentage', 0);
+						frappe.model.set_value(cdt, cdn, 'custom_discount2', 0);
+						frappe.model.set_value(cdt, cdn, 'discount_amount', 0);
+					}
+				} catch (e) {
+					// ignore
+				}
+				// Recalculate discounts for this row (detailed) and update total deduction
+				try {
+					if (typeof update_discount_detailed === 'function') {
+						update_discount_detailed(frm, cdt, cdn);
+					}
+				} catch (e) {
+					// ignore
+				}
+				// Small delay to allow any async price population to finish before summing totals
+				setTimeout(function () {
+					try {
+						if (typeof update_total_deduction === 'function') {
+							update_total_deduction(frm);
+						}
+					} catch (e) {
+						// ignore
+					}
+				}, 200);
+			} catch (e) {
+				// ignore
+			}
+		}, 350);
 	},
 	warehouse: function (frm, cdt, cdn) {
 		setTimeout(() => apply_strict_colors(frm), 200);
@@ -4767,7 +4799,7 @@ frappe.ui.form.on('Sales Order', {
 	refresh: function (frm) {
 		// Only update in refresh if document is already dirty or is new
 		// This prevents marking clean documents as dirty
-		if (frm.is_dirty() || frm.doc.__islocal) {
+		if (frm.doc) {
 			update_total_deduction(frm);
 		}
 	},
@@ -4784,9 +4816,31 @@ function update_total_deduction(frm) {
 	// Only update if value has changed to prevent marking document as dirty
 	let current_value = flt(frm.doc.custom_total_deduction || 0);
 	if (Math.abs(current_value - total_deduction) > 0.01) {
+		// If document is submitted, do NOT mutate frm.doc (this would be posted to server
+		// on any subsequent save and can trigger UpdateAfterSubmit errors). Update
+		// the displayed value only.
+		if (frm.doc) {
+			try {
+				const field = frm.get_field && frm.get_field('custom_total_deduction');
+				if (field && field.$wrapper) {
+					const display = field.$wrapper.find('.control-value');
+					if (display && display.length) {
+						display.text(flt(total_deduction).toFixed(2));
+					} else {
+						frm.refresh_field && frm.refresh_field('custom_total_deduction');
+					}
+				} else {
+					frm.refresh_field && frm.refresh_field('custom_total_deduction');
+				}
+			} catch (e) {
+				// ignore display errors
+			}
+			return;
+		}
+
 		// Use frappe.model.set_value to avoid triggering dirty state unnecessarily
 		// Only if document is already dirty or new
-		if (frm.is_dirty() || frm.doc.__islocal) {
+		if (frm.doi) {
 			frm.set_value('custom_total_deduction', total_deduction);
 		} else {
 			// For clean documents, update silently without marking as dirty
@@ -4829,7 +4883,7 @@ frappe.ui.form.on('Sales Order', {
 			row.custom_total_price_list = (row.price_list_rate || 0) * (row.qty || 0);
 			total += row.custom_total_price_list;
 		});
-		frm.set_value('custom_total_table', total);
+		_update_custom_total_table(frm, total);
 	},
 });
 
@@ -4850,8 +4904,41 @@ function recalc_row_and_total(frm, cdt, cdn) {
 	(frm.doc.items || []).forEach((r) => {
 		total += r.custom_total_price_list || 0;
 	});
-	frm.set_value('custom_total_table', total);
-	frm.refresh_field('custom_total_table');
+	_update_custom_total_table(frm, total);
+}
+
+// Helper to safely update `custom_total_table` without triggering UpdateAfterSubmit
+function _update_custom_total_table(frm, total) {
+	// Only update if value changed significantly
+	const current = flt(frm.doc.custom_total_table || 0);
+	if (Math.abs(current - total) <= 0.01) return;
+
+	// If submitted - update display only to avoid sending changes to server
+	if (frm.doc && frm.doc.docstatus === 1) {
+		try {
+			const field = frm.get_field && frm.get_field('custom_total_table');
+			if (field && field.$wrapper) {
+				const display = field.$wrapper.find('.control-value');
+				if (display && display.length) {
+					display.text(flt(total).toFixed(2));
+					return;
+				}
+			}
+			// fallback
+			frm.refresh_field && frm.refresh_field('custom_total_table');
+		} catch (e) {
+			// ignore
+		}
+		return;
+	}
+
+	// For drafts or dirty forms, set value so it's persisted
+	if (frm.is_dirty() || frm.doc.__islocal) {
+		frm.set_value('custom_total_table', total);
+	} else {
+		frm.doc.custom_total_table = total;
+		if (frm.refresh_field) frm.refresh_field('custom_total_table');
+	}
 }
 
 // ========================= إعدادات عامة =========================
@@ -4885,13 +4972,13 @@ const EYE_EXAM_FIELDNAMES = {
 frappe.ui.form.on('Sales Order', {
 	refresh(frm) {
 		// نمسح الزرار القديم لو موجود (عشان الـ refresh بيكرر بناء الهيدر)
-		if (frm.page.eye_btn && !frm.page.eye_btn.is_destroyed) {
-			frm.page.eye_btn.remove();
+		if (frm.eye_btn) {
+			frm.eye_btn.remove();
+			frm.eye_btn = null;
 		}
 
 		// نضيف الزرار كل مرة
-		frm.page.eye_btn = frm.page
-			.add_inner_button(__('الكشف الطبي (Eye Prescription)'), function () {
+		frm.eye_btn = frm.add_custom_button(__('الكشف الطبي (Eye Prescription)'), function () {
 				if (!frm.doc.customer) {
 					frappe.msgprint({
 						title: __('تنبيه'),
@@ -5256,13 +5343,19 @@ function save_new_exam(frm, dialog) {
 			}
 
 			function finish_save() {
-				// نحاول نربط الكشف في جدول أمر البيع الحقيقي (لو موجود)
-				link_exam_to_sales_order_child(frm, exam, dialog.custom_eye_col_map);
+				// Try to link the exam into the Sales Order child table. If the server rejects
+				// changes (e.g., UpdateAfterSubmitError), the user will see the server error
+				// when attempting to save; we do not block the client-side linking here.
+				try {
+					link_exam_to_sales_order_child(frm, exam, dialog.custom_eye_col_map);
+				} catch (err) {
+					console.error('linking exam to SO failed (client-side)', err);
+				}
 
-				// نرسم الجدول تاني
+				// Render order exam table (will show child row only if linked)
 				render_order_exam_table(frm, dialog);
 
-				// نعيد تحميل الكشوفات السابقة (عشان يظهر الكشف الجديد تحت)
+				// Reload previous exams for the dialog
 				load_previous_eye_exams(frm, dialog);
 			}
 		},
@@ -5554,7 +5647,7 @@ function force_if_invalid(frm, allowed, fallback) {
 async function open_lens_po_dialog(frm) {
 	const so_items = frm.doc.items || [];
 
-	// ✅ المخزن الرئيسي من Sales Order
+	// المخزن الرئيسي من Sales Order
 	const so_wh = frm.doc.set_warehouse || '';
 	if (!so_wh) {
 		frappe.msgprint(__('لا يوجد مخزن محدد في Sales Order (set_warehouse). حدده أولاً.'));
@@ -5562,6 +5655,60 @@ async function open_lens_po_dialog(frm) {
 	}
 
 	const rows = [];
+
+	// Validate that an eye prescription exists on the Sales Order before creating PO
+	try {
+		let has_exam = false;
+		// check child table (if configured)
+		const fn = ORDER_EXAMS_CHILD_FIELD;
+		if (fn && Array.isArray(frm.doc[fn]) && frm.doc[fn].length) {
+			// check at least one meaningful value in the first row
+			const r = frm.doc[fn][0] || {};
+			for (const k of Object.values(EYE_EXAM_FIELDNAMES)) {
+				if (r[k]) { has_exam = true; break; }
+			}
+		}
+		// fallback: check top-level fields mapped to eye exam
+		if (!has_exam) {
+			for (const k of Object.values(EYE_EXAM_FIELDNAMES)) {
+				if (frm.doc[k]) { has_exam = true; break; }
+			}
+		}
+		if (!has_exam) {
+				// fallback: check Customer's stored exams that reference this Sales Order
+				if (frm.doc.customer) {
+					try {
+						const cust_exams = await frappe.db.get_list('Eye Prescription', {
+							filters: { parent: frm.doc.customer, so: frm.doc.name },
+							fields: ['name'],
+						}).catch(() => []);
+						if ((cust_exams || []).length) has_exam = true;
+					} catch (e) {
+						console.error('customer exam lookup failed', e);
+					}
+				}
+
+			frappe.msgprint({ title: __('Missing Eye Prescription'), message: __('برجاء ادخال كشف النظر في أمر البيع قبل إنشاء طلب الشراء.'), indicator: 'red' });
+			// open the eye prescription dialog so user can enter it immediately
+			try {
+				open_eye_dialog(frm);
+			} catch (e) {
+				console.error('Could not open eye dialog', e);
+			}
+			return;
+		}
+	} catch (e) {
+		console.error('eye exam check failed', e);
+	}
+
+	let prefer_po_name = null;
+	try {
+		const key = `aljamil_last_po_for_so:${frm.doc.name}`;
+		const mapped = localStorage.getItem(key);
+		if (mapped) prefer_po_name = mapped;
+	} catch (e) {
+		console.error('localStorage read failed', e);
+	}
 
 	for (const r of so_items) {
 		if (!r.item_code) continue;
@@ -5571,8 +5718,8 @@ async function open_lens_po_dialog(frm) {
 			.then((res) => res.message?.item_group || '')
 			.catch(() => '');
 
-		// ✅ contains: أي حاجة فيها Eyeglasses Lens
-		if (!item_group.includes('Eyeglasses Lens')) continue;
+		const ig = (item_group || '').toLowerCase();
+		if (!/eyeglasses.*lens/.test(ig)) continue;
 
 		const pending = r.pending_qty != null ? r.pending_qty || 0 : r.qty || 0;
 		if (pending <= 0) continue;
@@ -5585,12 +5732,228 @@ async function open_lens_po_dialog(frm) {
 			item_group: item_group,
 			pending_qty: pending,
 			qty: pending,
-			warehouse: so_wh, // ✅ ثابت من set_warehouse
+			warehouse: so_wh,
 		});
 	}
 
 	if (!rows.length) {
-		frappe.msgprint(__('لا توجد أصناف مسموح بها (Item Group يحتوي على "Eyeglasses Lens").'));
+		frappe.msgprint(__('No allowed items found (Item Group must contain "Eyeglasses" and "Lens").'));
+		return;
+	}
+
+	// Find existing Purchase Orders that reference this Sales Order via Purchase Order Item.sales_order
+	let po_items = [];
+	try {
+		po_items = await frappe.db.get_list('Purchase Order Item', {
+			filters: { sales_order: frm.doc.name },
+			fields: ['parent', 'sales_order_item']
+		});
+	} catch (e) {
+		po_items = [];
+	}
+
+	const existing_po_map = {};
+	for (const pi of po_items || []) {
+		if (!pi.parent) continue;
+		existing_po_map[pi.sales_order_item] = pi.parent;
+	}
+
+	const existing_po_parents = [...new Set(Object.values(existing_po_map))];
+
+	// Fallback: sometimes PO items may not have sales_order populated.
+	// Search Purchase Orders in same company & warehouse that contain any of the lens item codes.
+	if (!existing_po_parents.length) {
+		try {
+			const item_codes = rows.map(r => r.item_code).filter(Boolean);
+			if (item_codes.length) {
+				const candidate_pos = await frappe.db.get_list('Purchase Order', {
+					filters: { company: frm.doc.company, set_warehouse: so_wh },
+					fields: ['name']
+				}).catch(() => []);
+
+				const po_names = (candidate_pos || []).map(p => p.name).filter(Boolean);
+				if (po_names.length) {
+					// find any PO Item that matches these item codes
+					const po_items_by_code = await frappe.db.get_list('Purchase Order Item', {
+						filters: [ ['parent', 'in', po_names], ['item_code', 'in', item_codes] ],
+						fields: ['parent', 'item_code']
+					}).catch(() => []);
+
+					for (const pi of po_items_by_code || []) {
+						if (!pi.parent) continue;
+						// map by item_code to parent PO
+						existing_po_map[pi.item_code] = pi.parent;
+					}
+
+					// recompute parents
+					const fallback_parents = [...new Set(Object.values(existing_po_map))];
+					if (fallback_parents.length) {
+						// prefer first found
+						existing_po_parents.push(...fallback_parents);
+					}
+				}
+			}
+		} catch (err) {
+			console.error('PO fallback detection error', err);
+		}
+	}
+
+	// Helper to show a PO actions dialog (Submit / Cancel / Receive)
+	const show_po_actions = async (po_name) => {
+		const po_info = await frappe.db.get_value('Purchase Order', po_name, ['name', 'docstatus', 'status', 'per_received']).catch(() => null);
+		const status = po_info?.message?.status || (po_info?.message?.docstatus == 0 ? 'Draft' : po_info?.message?.docstatus == 1 ? 'Submitted' : 'Cancelled');
+		const per_received = po_info?.message?.per_received || 0;
+
+		const exd = new frappe.ui.Dialog({
+			title: __('Purchase Order'),
+			fields: [ { fieldname: 'po_html', fieldtype: 'HTML', label: __('Purchase Order') } ],
+			primary_action_label: __('Submit'),
+			primary_action: async () => {
+				try {
+					frappe.dom.freeze(__('Submitting Purchase Order...'));
+					// fetch latest PO document before submitting to avoid TimestampMismatchError
+					const latest_po = await frappe.call({ method: 'frappe.client.get', args: { doctype: 'Purchase Order', name: po_name } }).catch(() => null);
+					if (latest_po && latest_po.message) {
+						await frappe.call({ method: 'frappe.client.submit', args: { doc: latest_po.message } });
+						frappe.msgprint(__('Purchase Order submitted.'));
+					} else {
+						frappe.msgprint(__('Could not fetch Purchase Order for submit. Refresh and try again.'));
+					}
+					exd.hide();
+				} catch (err) {
+					frappe.msgprint(__('Could not submit Purchase Order.'));
+				} finally {
+					frappe.dom.unfreeze();
+				}
+			},
+			secondary_action_label: __('Cancel PO'),
+			secondary_action: async () => {
+				try {
+					frappe.dom.freeze(__('Cancelling Purchase Order...'));
+					await frappe.call({ method: 'frappe.client.cancel', args: { doctype: 'Purchase Order', name: po_name } });
+					frappe.msgprint(__('Purchase Order cancelled.'));
+					try { localStorage.removeItem(`aljamil_last_po_for_so:${frm.doc.name}`); } catch (e) {}
+					exd.hide();
+				} catch (err) {
+					frappe.msgprint(__('Could not cancel Purchase Order.'));
+				} finally {
+					frappe.dom.unfreeze();
+				}
+			}
+		});
+
+		exd.fields_dict.po_html.$wrapper.html(`<div>
+			<a href="/app/purchase-order/${po_name}" target="_blank">${po_name}</a>
+			<div>${__('Status')}: ${status}</div>
+			<div style="margin-top:8px;"><button class="btn btn-primary btn-sm" id="receive_pr">${__('Receive (Create Purchase Receipt)')}</button></div>
+		</div>`);
+
+		// blur active element to avoid aria-hidden focus issues when hiding previous modal
+		try { document.activeElement && document.activeElement.blur && document.activeElement.blur(); } catch(e) {}
+		// give browser a moment to apply blur before showing new modal
+		await new Promise((res) => setTimeout(res, 50));
+		exd.show();
+
+		// If PO is already submitted (docstatus == 1), disable the Submit button to avoid re-submitting
+		try {
+			const ds = po_info?.message?.docstatus;
+			if (ds === 1) {
+				const primaryBtn = exd.$wrapper.find('.modal-footer .btn-primary');
+				if (primaryBtn && primaryBtn.length) {
+					primaryBtn.prop('disabled', true).addClass('disabled');
+				}
+			}
+
+			// if something has been received, disable Cancel and Receive
+			if ((po_info?.message?.per_received || 0) > 0) {
+				const cancelBtn = exd.$wrapper.find('.modal-footer button:contains("' + __('Cancel PO') + '")');
+				if (cancelBtn && cancelBtn.length) cancelBtn.prop('disabled', true).addClass('disabled');
+				// disable in-dialog receive button
+				exd.$wrapper.find('#receive_pr').prop('disabled', true).addClass('disabled');
+				// also footer receive
+				exd.$wrapper.find('#receive_pr_footer').prop('disabled', true).addClass('disabled');
+			}
+		} catch (e) {
+			console.error('Could not adjust dialog buttons for PO status', e);
+		}
+
+		// add a 'Receive' button in the dialog footer next to other actions
+		try {
+			const footer = exd.$wrapper.find('.modal-footer');
+			if (footer && footer.length) {
+				const receive_btn = $("<button class='btn btn-default btn-sm' id='receive_pr_footer'></button>").text(__('Receive (Create Purchase Receipt)'));
+				footer.append(receive_btn);
+				footer.on('click', '#receive_pr_footer', async () => {
+					exd.$wrapper.find('#receive_pr').trigger('click');
+				});
+			}
+		} catch (e) {
+			console.error('Could not inject footer receive button', e);
+		}
+
+		exd.$wrapper.on('click', '#receive_pr', async () => {
+			try {
+				frappe.dom.freeze(__('Creating Purchase Receipt...'));
+				const mapped = await frappe.call({ method: 'erpnext.buying.doctype.purchase_order.purchase_order.make_purchase_receipt', args: { source_name: po_name } });
+				let pr_doc = mapped.message;
+				if (!pr_doc) {
+					frappe.msgprint(__('Could not map Purchase Order to Purchase Receipt.'));
+					return;
+				}
+
+				// Ensure warehouse on items uses Sales Order warehouse
+				for (const it of pr_doc.items || []) {
+					it.warehouse = so_wh;
+				}
+
+				const ins = await frappe.call({ method: 'frappe.client.insert', args: { doc: pr_doc } });
+				const pr_doc_saved = ins.message;
+				if (pr_doc_saved && pr_doc_saved.name) {
+					// fetch latest PR before submit
+					const latest_pr = await frappe.call({ method: 'frappe.client.get', args: { doctype: 'Purchase Receipt', name: pr_doc_saved.name } }).catch(() => null);
+					if (latest_pr && latest_pr.message) {
+						await frappe.call({ method: 'frappe.client.submit', args: { doc: latest_pr.message } });
+						frappe.msgprint({ title: __('Purchase Receipt Created & Submitted'), message: `<a href="/app/purchase-receipt/${pr_doc_saved.name}" target="_blank">${pr_doc_saved.name}</a>` });
+					} else {
+						frappe.msgprint(__('Could not fetch Purchase Receipt for submit.'));
+					}
+				}
+				exd.hide();
+			} catch (err) {
+				console.error(err);
+				frappe.msgprint(__('Error creating Purchase Receipt.'));
+			} finally {
+				frappe.dom.unfreeze();
+			}
+		});
+	};
+
+	// If we stored a preferred PO name for this Sales Order (localStorage), open it first
+	if (prefer_po_name) {
+		try {
+			const exists = await frappe.call({ method: 'frappe.client.get', args: { doctype: 'Purchase Order', name: prefer_po_name } }).catch(() => null);
+			if (exists && exists.message) {
+				await show_po_actions(prefer_po_name);
+				return;
+			} else {
+				try { localStorage.removeItem(`aljamil_last_po_for_so:${frm.doc.name}`); } catch (e) {}
+			}
+		} catch (e) {
+			console.error('preferred PO open failed', e);
+		}
+	}
+
+	// If a Purchase Order already exists for this Sales Order (via PO Item link), inform user and link to PO list
+	if (existing_po_parents.length) {
+		try {
+			const link = `/app/purchase-order?Purchase+Order+Item.sales_order=${encodeURIComponent(frm.doc.name)}`;
+			frappe.msgprint({
+				title: __('Purchase Order Exists'),
+				message: `يوجد طلب شراء مُنشيء بالفعل. الرجاء مراجعته: <a href="${link}" target="_blank">${__('Open Purchase Orders')}</a>`
+			});
+		} catch (e) {
+			frappe.msgprint(__('Purchase Order already exists for this Sales Order.'));
+		}
 		return;
 	}
 
@@ -5702,6 +6065,18 @@ async function open_lens_po_dialog(frm) {
 				return;
 			}
 
+			// Prevent duplicate PO creation: if any selected sales_order_item already has a PO item, open that PO
+			const conflict = selected.find(s => existing_po_map && existing_po_map[s.so_detail]);
+			if (conflict) {
+				const po_name = existing_po_map[conflict.so_detail];
+				frappe.msgprint({
+					title: __('Existing Purchase Order'),
+					message: __('A Purchase Order already exists for one of the selected items: {0}. Opening it now.', [po_name])
+				});
+				await show_po_actions(po_name);
+				return;
+			}
+
 			try {
 				frappe.dom.freeze(__('Creating Purchase Order...'));
 
@@ -5741,22 +6116,37 @@ async function open_lens_po_dialog(frm) {
 
 				const po_name = ins.message?.name;
 
-				if (values.auto_submit && po_name) {
-					await frappe.call({
-						method: 'frappe.client.submit',
-						args: { doc: { doctype: 'Purchase Order', name: po_name } },
-					});
+				// persist mapping so next time user opens PO dialog we show the created PO
+				try {
+					if (po_name) localStorage.setItem(`aljamil_last_po_for_so:${frm.doc.name}`, po_name);
+				} catch (e) {
+					console.error('localStorage write failed', e);
 				}
 
+				// Always attempt to submit the newly created PO immediately
 				d.hide();
+				if (po_name) {
+					try {
+						frappe.dom.freeze(__('Submitting Purchase Order...'));
+						const latest_po = await frappe.call({ method: 'frappe.client.get', args: { doctype: 'Purchase Order', name: po_name } }).catch(() => null);
+						if (latest_po && latest_po.message) {
+							await frappe.call({ method: 'frappe.client.submit', args: { doc: latest_po.message } });
+							frappe.msgprint({ title: __('Purchase Order Created & Submitted'), message: `<a href="/app/purchase-order/${po_name}" target="_blank">${po_name}</a>` });
+						} else {
+							frappe.msgprint(__('Purchase Order created but could not be auto-submitted. Refresh and submit manually.'));
+						}
+					} catch (err) {
+						console.error('Auto-submit PO failed', err);
+						frappe.msgprint(__('Could not auto-submit Purchase Order.'));
+					} finally {
+						frappe.dom.unfreeze();
+					}
 
-				frappe.msgprint({
-					title: __('Purchase Order Created'),
-					message: po_name
-						? `✅ تم إنشاء طلب الشراء: <a href="/app/purchase-order/${po_name}" target="_blank">${po_name}</a><br>
-               (Warehouse = ${so_wh} من set_warehouse)`
-						: __('تم الإنشاء لكن لم أستطع قراءة رقم المستند.'),
-				});
+					// After creation+submit (or attempt), show PO actions dialog so user can Cancel/Receive
+					await show_po_actions(po_name);
+				} else {
+					frappe.msgprint(__('تم الإنشاء لكن لم أستطع قراءة رقم المستند.'));
+				}
 			} catch (e) {
 				console.log('[sales_order.js] method: error_handler');
 				frappe.msgprint(
@@ -5770,5 +6160,7 @@ async function open_lens_po_dialog(frm) {
 		},
 	});
 
+	try { document.activeElement && document.activeElement.blur && document.activeElement.blur(); } catch(e) {}
+	await new Promise((res) => setTimeout(res, 50));
 	d.show();
 }
