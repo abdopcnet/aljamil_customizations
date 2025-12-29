@@ -1,6 +1,6 @@
 ### Aljamil Customizations
 
-![Version](https://img.shields.io/badge/version-27.12.2025-blue)
+![Version](https://img.shields.io/badge/version-29.12.2025-blue)
 
 
 Aljamil Customizations
