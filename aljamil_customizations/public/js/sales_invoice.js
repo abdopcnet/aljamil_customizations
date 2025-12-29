@@ -29,7 +29,7 @@ function open_quick_payment_dialog_for_so(frm) {
 			},
 			{
 				fieldname: 'mode_of_payment',
-                // ========================= إعدادات عامة =========================
+				 // ========================= إعدادات عامة =========================
 
                 // اسم جدول الكشف في العميل (Customer)
                 const CUSTOMER_EXAMS_CHILD_FIELD = "size_t";
@@ -634,7 +634,7 @@ function open_quick_payment_dialog_for_so(frm) {
 
 // ========================= زرار الكشف الطبي في أمر البيع =========================
 
-frappe.ui.form.on("Sales Order", {
+frappe.ui.form.on("Sales Invoice", {
     refresh(frm) {
         // نمسح الزرار القديم لو موجود (عشان الـ refresh بيكرر بناء الهيدر)
         if (frm.page.eye_btn && !frm.page.eye_btn.is_destroyed) {
@@ -999,7 +999,7 @@ function link_exam_to_sales_order_child(frm, exam, field_map) {
     const fn = ORDER_EXAMS_CHILD_FIELD;
     if (!fn || !frm.fields_dict[fn]) {
         // مفيش جدول child فى أمر البيع أو الاسم مش مظبوط → نتجاهل
-        console.warn("Eye Prescription child table not found on Sales Order, skipping link.");
+        console.warn("Eye Prescription child table not found on Sales Invoice, skipping link.");
         return;
     }
 
