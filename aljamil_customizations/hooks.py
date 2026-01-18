@@ -50,6 +50,12 @@ doctype_js = {
     ],
     "Sales Invoice": [
         "public/js/sales_invoice.js",
+    ],
+     "Purchase Order": [
+        "public/js/purchase_order.js",
+    ],
+     "Purchase Invoice": [
+        "public/js/purchase_invoice.js",
     ]
 }
 # doctype_list_js = {"doctype" : "public/js/doctype_list.js"}
@@ -151,6 +157,10 @@ doc_events = {
     },
     "Sales Invoice": {
         "before_save": "aljamil_customizations.sales_invoice.send_discount_approval_notifications",
+    },
+    "Landed Cost Voucher": {
+        "on_submit": "aljamil_customizations.landed_cost_voucher.create_expense_journal_entries",
+        "on_cancel": "aljamil_customizations.landed_cost_voucher.cancel_expense_journal_entries",
     },
 }
 
