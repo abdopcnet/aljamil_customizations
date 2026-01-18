@@ -72,80 +72,35 @@ frappe.ui.form.on('Sales Invoice', {
 });
 
 function check_sales_invoice_stock(frm) {
-	// Collect all items that need to be checked
-	const items_to_check = frm.doc.items
-		.map((item) => ({
-			item_code: item.item_code,
-			warehouse: item.warehouse,
-			qty: item.qty,
-		}))
-		.filter((item) => item.item_code && item.warehouse && item.qty > 0);
+	// Delegate to the shared check implementation
+	return check_stock_before_invoice(frm).then((res) => {
+		if (!res || !res.success) {
+			const insufficient_items = (res && res.insufficient_items) || [];
+			let error_message = '❌ <b>لا يمكن إنشاء الفاتورة - منتجات ناقصة في المخزن:</b><br>';
+			insufficient_items.forEach((item) => {
+				error_message += `
+					<div style="margin: 8px 0; padding: 8px; background-color: #fff3cd; border-left: 3px solid #ff6b6b; border-radius: 3px;">
+						<b style="color: #d9534f;">${item.item_code}</b> - ${item.warehouse}<br>
+						مطلوب: <b>${item.required}</b> | متاح: <b>${item.available}</b> | ناقص: <span style="color: red; font-weight: bold;">${item.short}</span>
+					</div>
+				`;
+			});
+			error_message += '<br>⚠️ يجب توفير المنتجات الناقصة في المخزن قبل إنشاء الفاتورة';
 
-	if (!items_to_check.length) return;
-
-	// Check stock for each item
-	frappe.call({
-		method: 'frappe.client.get_list',
-		args: {
-			doctype: 'Bin',
-			filters: {
-				item_code: ['in', items_to_check.map((i) => i.item_code)],
-			},
-			fields: ['name', 'item_code', 'warehouse', 'actual_qty'],
-		},
-		async: false,
-		callback: function (r) {
-			const bins = r.message || [];
-			const insufficient_items = [];
-
-			items_to_check.forEach((item) => {
-				// البحث عن الرصيد في هذا المخزن
-				const bin = bins.find(
-					(b) => b.item_code === item.item_code && b.warehouse === item.warehouse,
-				);
-
-				const available_qty = bin ? bin.actual_qty || 0 : 0;
-
-				// التحقق من توفر الكمية
-				if (available_qty < item.qty) {
-					insufficient_items.push({
-						item_code: item.item_code,
-						warehouse: item.warehouse,
-						required: item.qty,
-						available: available_qty,
-						short: item.qty - available_qty,
-					});
-				}
+			frappe.msgprint({
+				title: '❌ منتجات ناقصة',
+				message: error_message,
+				indicator: 'red',
 			});
 
-			// إذا كان هناك منتجات ناقصة، يتم رفع خطأ ومنع الحفظ
-			if (insufficient_items.length > 0) {
-				let error_message =
-					'❌ <b>لا يمكن إنشاء الفاتورة - منتجات ناقصة في المخزن:</b><br>';
-				insufficient_items.forEach((item) => {
-					error_message += `
-						<div style="margin: 8px 0; padding: 8px; background-color: #fff3cd; border-left: 3px solid #ff6b6b; border-radius: 3px;">
-							<b style="color: #d9534f;">${item.item_code}</b> - ${item.warehouse}<br>
-							مطلوب: <b>${item.required}</b> | متاح: <b>${item.available}</b> | ناقص: <span style="color: red; font-weight: bold;">${item.short}</span>
-						</div>
-					`;
-				});
-				error_message += '<br>⚠️ يجب توفير المنتجات الناقصة في المخزن قبل إنشاء الفاتورة';
-
-				frappe.msgprint({
-					title: '❌ منتجات ناقصة',
-					message: error_message,
-					indicator: 'red',
-				});
-
-				frappe.throw(
-					__(
-						'لا يمكن إنشاء الفاتورة. الصنف غير موجود: ' +
-							insufficient_items.map((i) => i.item_code).join(', '),
-					),
-				);
-			}
-		},
+			frappe.throw(
+				__(
+					'لا يمكن إنشاء الفاتورة. الصنف غير موجود: ' +
+						insufficient_items.map((i) => i.item_code).join(', '),
+				),
+			);
+		}
+		return res;
 	});
 }
 
@@ -673,6 +628,13 @@ function update_discount_simple(frm, cdt, cdn) {
 	// Sum discounts only and write result
 	let total_discount = (row.custom_discount || 0) + (row.custom_discount2 || 0) + base_discount;
 
+	// If we are in a multi-add operation, avoid triggering handlers
+	// for every single row — write locally and refresh once after batch.
+	if (frm._multi_adding) {
+		row.discount_amount = total_discount;
+		return;
+	}
+
 	// Write result to field, as if user wrote it manually
 	frappe.model.set_value(cdt, cdn, 'discount_amount', total_discount);
 }
@@ -695,15 +657,21 @@ frappe.ui.form.on('Sales Order', {
 				if (r.item_code && frm.doc.selling_price_list) {
 					return get_item_max_discount(r.item_code, frm.doc.selling_price_list).then(
 						(max_disc) => {
-							return get_allowed_discount_limit(frm, max_disc).then((allowed) => {
+							// Get employee-specific limit to show breakdown
+							return get_sales_person_employee_discount_limit(frm).then((employee_limit) => {
+								const prod = Number(max_disc) || 0;
+								const emp = Number(employee_limit) || 0;
+								const allowed = prod + emp;
+
 								if ((+r.custom_discount_percentage || 0) > allowed) {
 									r.custom_discount_percentage =
 										r._original_custom_discount_percentage || 0;
 									frappe.throw(
-										__(
-											'🚫 نسبة الخصم (custom_discount_percentage) لا يمكن أن تتجاوز الحد ({0}%)',
-											[allowed],
-										),
+										__('🚫 لا يمكن تخطي حدود الخصم: خصم المنتج {0}%، خصم الموظف {1}%، الإجمالي المسموح {2}%', [
+											prod,
+											emp,
+											allowed,
+										]),
 									);
 								}
 							});
@@ -820,15 +788,67 @@ function validate_discount_field(frm, cdt, cdn) {
 }
 
 function get_item_max_discount(item_code, price_list) {
+	// Prefer the Item-level `max_discount` field. Fallback to Item Price.custom_discount_percent.
 	return frappe.db
-		.get_value('Item Price', { item_code, price_list }, 'custom_discount_percent')
-		.then((r) => +r.message?.custom_discount_percent || 0);
+		.get_value('Item', item_code, 'max_discount')
+		.then((res) => {
+			const m = res.message && res.message.max_discount;
+			if (m != null && m !== '') return Number(m) || 0;
+			// Fallback to Item Price
+			return frappe
+				.db.get_value('Item Price', { item_code, price_list }, 'custom_discount_percent')
+				.then((r) => +r.message?.custom_discount_percent || 0);
+		})
+		.catch(() => {
+			// On any error, fallback to Item Price lookup
+			return frappe.db
+				.get_value('Item Price', { item_code, price_list }, 'custom_discount_percent')
+				.then((r) => +r.message?.custom_discount_percent || 0)
+				.catch(() => 0);
+		});
 }
 
 function get_sales_person_employee_discount_limit(frm) {
 	const sales_person_name = frm?.doc?.custom_sales_person;
 	if (!sales_person_name) return Promise.resolve(0);
 
+	// First try to read discounts for the current logged-in user from `discount user`
+	const current_user =
+		(frappe.session && frappe.session.user) ||
+		frappe.user?.name ||
+		frappe.user?.fullname ||
+		null;
+	if (current_user) {
+		return frappe.db
+			.get_value('discount user', { user: current_user }, [
+				'discount_percentage',
+				'discount_amount',
+			])
+			.then((r) => {
+				const msg = r.message || {};
+				if (msg.discount_percentage != null) {
+					return Number(msg.discount_percentage) || 0;
+				}
+				// If discount user exists but has no percentage, fallthrough to Sales Person logic
+				return null;
+			})
+			.then((maybe) => {
+				if (maybe != null) return maybe;
+				// Fallback: original Sales Person -> Employee lookup
+				return frappe.db
+					.get_value('Sales Person', sales_person_name, 'employee')
+					.then((r) => r.message?.employee)
+					.then((employee_id) => {
+						if (!employee_id) return 0;
+						return frappe.db
+							.get_value('Employee', employee_id, 'custom_discount_percentage_limit')
+							.then((e) => +e.message?.custom_discount_percentage_limit || 0);
+					});
+			})
+			.catch(() => 0);
+	}
+
+	// If we don't have session user, fallback to Sales Person -> Employee
 	return frappe.db
 		.get_value('Sales Person', sales_person_name, 'employee')
 		.then((r) => r.message?.employee)
@@ -842,9 +862,11 @@ function get_sales_person_employee_discount_limit(frm) {
 }
 
 function get_allowed_discount_limit(frm, max_discount = 0) {
-	return get_sales_person_employee_discount_limit(frm).then((limit) =>
-		Math.max(max_discount, limit),
-	);
+	return get_sales_person_employee_discount_limit(frm).then((limit) => {
+		const a = Number(max_discount) || 0;
+		const b = Number(limit) || 0;
+		return a + b;
+	});
 }
 
 function check_main_discount(frm) {
@@ -894,36 +916,12 @@ frappe.ui.form.on('Sales Order', {
 			}
 
 			if (row.item_code && frm.doc.selling_price_list) {
-				const price = await frappe.db.get_value(
-					'Item Price',
-					{
-						item_code: row.item_code,
-						price_list: frm.doc.selling_price_list,
-					},
-					'custom_discount_percent',
-				);
+				const max_discount = await get_item_max_discount(row.item_code, frm.doc.selling_price_list);
 
-				const max_discount = Number(price.message?.custom_discount_percent) || 0;
+				// Get discount percentage limit — prefer discount user (current user), fallback to Sales Person -> Employee
+				const employee_limit = await get_sales_person_employee_discount_limit(frm);
 
-				let employee_limit = 0;
-				if (frm.doc.custom_sales_person) {
-					const sales_person = await frappe.db.get_value(
-						'Sales Person',
-						frm.doc.custom_sales_person,
-						'employee',
-					);
-					if (sales_person.message?.employee) {
-						const employee = await frappe.db.get_value(
-							'Employee',
-							sales_person.message.employee,
-							'custom_discount_percentage_limit',
-						);
-						employee_limit =
-							Number(employee.message?.custom_discount_percentage_limit) || 0;
-					}
-				}
-
-				const allowed_limit = Math.max(max_discount, employee_limit);
+				const allowed_limit = (Number(max_discount) || 0) + (Number(employee_limit) || 0);
 				const entered = Number(row.custom_discount_percentage) || 0;
 
 				if (entered > allowed_limit) {
@@ -977,21 +975,12 @@ frappe.ui.form.on('Sales Order Item', {
 
 		const entered = Number(row.custom_discount_percentage) || 0;
 
-		frappe.db
-			.get_value(
-				'Item Price',
-				{
-					item_code: row.item_code,
-					price_list: frm.doc.selling_price_list,
-				},
-				'custom_discount_percent',
-			)
-			.then((r) => {
-				const max_discount = Number(r.message?.custom_discount_percent) || 0;
+		get_item_max_discount(row.item_code, frm.doc.selling_price_list).then((max_discount) => {
 
 				// Helper function to process discount validation
 				function processDiscountValidation(max_discount, employee_limit) {
-					const allowed_limit = Math.max(max_discount, employee_limit);
+					const allowed_limit =
+						(Number(max_discount) || 0) + (Number(employee_limit) || 0);
 					const entered = Number(row.custom_discount_percentage) || 0;
 
 					if (entered > allowed_limit) {
@@ -1006,10 +995,16 @@ frappe.ui.form.on('Sales Order Item', {
 
 						if (!frm._discount_msg_shown) {
 							frm._discount_msg_shown = true;
+							const prod = Number(max_discount) || 0;
+							const emp = Number(employee_limit) || 0;
+							const tot = prod + emp;
 							frappe.msgprint({
 								title: __('خصم غير مسموح'),
-								message: __('🚫 نسبة الخصم لا يمكن أن تتجاوز الحد ({0}%)', [
-									allowed_limit,
+								message: __('🚫 لا يمكن تخطي حدود الخصم: الصنف {0} - خصم المنتج {1}%، خصم الموظف {2}%، الإجمالي المسموح {3}%', [
+									row.item_code || '',
+									prod,
+									emp,
+									tot,
 								]),
 								indicator: 'red',
 							});
@@ -1027,28 +1022,10 @@ frappe.ui.form.on('Sales Order Item', {
 					}
 				}
 
-				// Get Employee from Sales Person instead of user_id
-				if (frm.doc.custom_sales_person) {
-					frappe.db
-						.get_value('Sales Person', frm.doc.custom_sales_person, 'employee')
-						.then((sales_person) => {
-							const employee_id = sales_person.message?.employee;
-							if (!employee_id)
-								return { message: { custom_discount_percentage_limit: 0 } };
-							return frappe.db.get_value(
-								'Employee',
-								employee_id,
-								'custom_discount_percentage_limit',
-							);
-						})
-						.then((employee) => {
-							const employee_limit =
-								Number(employee?.message?.custom_discount_percentage_limit) || 0;
-							processDiscountValidation(max_discount, employee_limit);
-						});
-				} else {
-					processDiscountValidation(max_discount, 0);
-				}
+				// Get discount percentage limit (reads discount user for current user first)
+				get_sales_person_employee_discount_limit(frm).then((employee_limit) => {
+					processDiscountValidation(max_discount, employee_limit || 0);
+				});
 			});
 	},
 
@@ -1061,8 +1038,24 @@ async function update_sales_limit(frm) {
 	try {
 		let employee = null;
 
-		if (frm.doc.custom_sales_person) {
-			// Get employee from Sales Person
+		// Try discount user by current logged-in user first
+		const current_user = (frappe.session && frappe.session.user) || frappe.user?.name || null;
+		if (current_user) {
+			const du = await frappe.db.get_value('discount user', { user: current_user }, [
+				'discount_amount',
+				'discount_percentage',
+			]);
+			if (du.message) {
+				employee = {
+					custom_sales_limit: Number(du.message.discount_amount) || 0,
+					custom_discount_percentage_limit: Number(du.message.discount_percentage) || 0,
+					name: current_user,
+				};
+			}
+		}
+
+		// Fallback: Sales Person -> Employee
+		if (!employee && frm.doc.custom_sales_person) {
 			const sales_person_data = await frappe.db.get_value(
 				'Sales Person',
 				frm.doc.custom_sales_person,
@@ -1079,8 +1072,6 @@ async function update_sales_limit(frm) {
 					name: sales_person_data.message.employee,
 				};
 			}
-		} else {
-			employee = null;
 		}
 
 		frm.employee = employee;
@@ -1703,7 +1694,8 @@ frappe.ui.form.on('Sales Order', {
 			frm.insurance_btn.remove();
 			frm.insurance_btn = null;
 		}
-		frm.insurance_btn = frm.add_custom_button(__('بيانات التأمين (Insurance Data)'), function () {
+		frm.insurance_btn = frm
+			.add_custom_button(__('بيانات التأمين (Insurance Data)'), function () {
 				// 1. التحقق من نوع الأمر
 				const type = frm.doc.order_type || frm.doc.custom_order_type;
 				if (type !== 'Insurance') {
@@ -1725,7 +1717,8 @@ frappe.ui.form.on('Sales Order', {
 					return;
 				}
 				open_insurance_dialog(frm);
-			}).addClass('btn-info');
+			})
+			.addClass('btn-info');
 	},
 });
 
@@ -2601,9 +2594,22 @@ frappe.ui.form.on('Sales Order', {
 		if (!grid) return;
 
 		// Add Multi Add button below the native items table
-		// This button is independent and always shows for native items table
+		// This button is independent and shows only for draft/unsaved docs
+		if (frm.doc && frm.doc.docstatus === 1) {
+			// If the button exists from a previous state, remove it
+			if (frm._multi_add_button && frm._multi_add_button.remove) {
+				try {
+					frm._multi_add_button.remove();
+				} catch (e) {}
+				frm._multi_add_button = null;
+				frm._multi_add_button_added = false;
+			}
+			return;
+		}
+
 		if (!frm._multi_add_button_added) {
-			grid.add_custom_button(
+			// store reference so we can remove later
+			frm._multi_add_button = grid.add_custom_button(
 				__('📦 Multi Add Items'),
 				function () {
 					open_multi_add_dialog_for_native_table(frm);
@@ -2669,103 +2675,149 @@ function open_multi_add_dialog_for_native_table(frm) {
 				rows_to_add.push({ item_code, qty, warehouse: values.warehouse || '' });
 			});
 
-			// Add items to native items table
-			// Use a promise chain to ensure items are added sequentially
-			let promise_chain = Promise.resolve();
-
+			// Add items to native items table in batch. Create children locally first
+			// then request item details in parallel. This avoids slow sequential
+			// server round-trips and reduces UI jank.
+			frm._multi_adding = true;
+			const created_children = [];
 			rows_to_add.forEach((row_data) => {
-				promise_chain = promise_chain.then(() => {
-					console.log('[sales_order.js] method: add_row_to_native_table');
-
-					return new Promise((resolve) => {
-						// Add child row to native items table
-						const child = frm.add_child('items');
-						child.qty = row_data.qty;
-						child.warehouse = row_data.warehouse || frm.doc.set_warehouse || '';
-						child.delivery_date =
-							frm.doc.delivery_date ||
-							frm.doc.transaction_date ||
-							frappe.datetime.nowdate();
-
-						// Set item_code which will trigger item_code change event to fetch details
-						frappe.model
-							.set_value(child.doctype, child.name, 'item_code', row_data.item_code)
-							.then(() => {
-								added_count++;
-								resolve();
-							});
-					});
-				});
+				console.log('[sales_order.js] method: add_row_to_native_table (batch)');
+				const child = frm.add_child('items');
+				child.qty = row_data.qty;
+				child.warehouse = row_data.warehouse || frm.doc.set_warehouse || '';
+				child.delivery_date =
+					frm.doc.delivery_date || frm.doc.transaction_date || frappe.datetime.nowdate();
+				// assign item_code locally; we'll call set_value in parallel to fetch details
+				child.item_code = row_data.item_code;
+				created_children.push(child);
 			});
 
-			promise_chain.then(() => {
-				console.log('[sales_order.js] method: multi_add_complete');
+			// Refresh immediately so the user sees the new rows at once
+			frm.refresh_field('items');
 
-				if (added_count > 0) {
-					// Refresh the items field to show the new rows
+			// Trigger item_code set_value calls in parallel to fetch server-side details
+			// and then explicitly trigger item_code handlers to ensure price fetching
+			const set_promises = created_children.map((child) =>
+				frappe.model
+					.set_value(child.doctype, child.name, 'item_code', child.item_code)
+					.then(() => {
+						// Ensure any item_code handlers run (custom or core)
+						try {
+							return frm.script_manager.trigger(
+								'item_code',
+								child.doctype,
+								child.name,
+							);
+						} catch (e) {
+							return Promise.resolve();
+						}
+					}),
+			);
+
+			Promise.all(set_promises)
+				.then(() => {
+					frm._multi_adding = false;
+					frm.refresh_field('items');
+					const added = created_children.length;
+					if (added > 0) {
+						frappe.show_alert({
+							message: __('{0} item(s) added', [added]),
+							indicator: 'green',
+						});
+					}
+				})
+				.catch(() => {
+					frm._multi_adding = false;
 					frm.refresh_field('items');
 					frappe.show_alert({
-						message: __('{0} item(s) added', [added_count]),
-						indicator: 'green',
+						message: __('Some items failed to fetch details'),
+						indicator: 'orange',
 					});
-				}
-			});
+				});
 
 			d.hide();
 		},
 	});
 
 	const results_html = $(`
-        <div style="max-height:400px;overflow:auto;">
-            <table style="width:100%;border-collapse:collapse;border:1px solid #d1d8dd;">
-                <thead>
-                    <tr style="background-color:#f5f5f5;">
-                        <th style="padding:8px;border:1px solid #d1d8dd;text-align:left;">Item Code</th>
-                        <th style="padding:8px;border:1px solid #d1d8dd;text-align:left;">Item Name</th>
-                        <th style="padding:8px;border:1px solid #d1d8dd;text-align:left;">Available Qty</th>
-                        <th style="padding:8px;border:1px solid #d1d8dd;text-align:left;width:80px;">Qty</th>
-                    </tr>
-                </thead>
-                <tbody></tbody>
-            </table>
-        </div>
-    `);
+		<div style="max-height:320px;overflow:auto;">
+			<table style="width:100%;border-collapse:collapse;border:1px solid #d1d8dd;">
+				<thead>
+					<tr style="background-color:#f5f5f5;">
+						<th style="padding:8px;border:1px solid #d1d8dd;text-align:left;">Item Code</th>
+						<th style="padding:8px;border:1px solid #d1d8dd;text-align:left;">Item Name</th>
+						<th style="padding:8px;border:1px solid #d1d8dd;text-align:left;">Available Qty</th>
+						<th style="padding:8px;border:1px solid #d1d8dd;text-align:left;width:80px;">Qty</th>
+					</tr>
+				</thead>
+				<tbody></tbody>
+			</table>
+		</div>
+		<div class="multi-pager" style="margin-top:8px;text-align:center;"></div>
+	`);
 	d.get_field('results').$wrapper.html(results_html);
 	const $tbody = results_html.find('tbody');
 
 	const search_field = d.get_field('search');
+	// initial page = 0
+	const page_state = { page: 0 };
 	search_field.df.onchange = () => {
 		const txt = search_field.get_value();
 		const wh = d.get_value('warehouse');
 		if (!txt || !wh) return;
-		search_items_with_stock_for_native(txt, wh, $tbody);
+		page_state.page = 0;
+		search_items_with_stock_for_native(txt, wh, $tbody, d, page_state.page);
 	};
 
 	d.show();
 }
 
 // Search items + stock for native items table
-function search_items_with_stock_for_native(txt, warehouse, $tbody) {
+function search_items_with_stock_for_native(txt, warehouse, $tbody, d, page = 0) {
 	console.log('[sales_order.js] method: search_items_with_stock_for_native');
 	$tbody.empty();
 
+	const page_length = 10;
+	const start = (page || 0) * page_length;
+
+	// Use search_widget which supports start/page_length for paging
 	frappe.call({
-		method: 'frappe.desk.search.search_link',
+		method: 'frappe.desk.search.search_widget',
 		args: {
 			doctype: 'Item',
 			txt: txt,
-			page_length: 20,
+			start: start,
+			page_length: page_length,
+			as_dict: 1,
 		},
 		callback(r) {
-			const results = r.results || r.message || [];
+			const results = r.message || r.results || [];
+			// search_widget returns list of dicts (as_dict=1). Map to {value, description}
+			const mapped = (results || []).map((row) => {
+				const keys = Object.keys(row || {});
+				const value = keys.length ? row[keys[0]] : '';
+				const description = keys.length > 1 ? row[keys[1]] : '';
+				return { value: value, description: description };
+			});
+			const results_mapped = mapped;
+			if (!results_mapped.length) {
+				$tbody.append(
+					'<tr><td colspan="4" style="padding:8px;text-align:center;color:#999;">No Items Found</td></tr>',
+				);
+				// update pager
+				render_multi_pager(d, page, 0);
+				return;
+			}
 			if (!results.length) {
 				$tbody.append(
 					'<tr><td colspan="4" style="padding:8px;text-align:center;color:#999;">No Items Found</td></tr>',
 				);
+				// update pager
+				render_multi_pager(d, page, 0);
 				return;
 			}
 
-			const item_codes = results.map((x) => x.value);
+			const item_codes = results_mapped.map((x) => x.value);
 
 			frappe.call({
 				method: 'frappe.client.get_list',
@@ -2781,28 +2833,63 @@ function search_items_with_stock_for_native(txt, warehouse, $tbody) {
 						bins[bin.item_code] = (bin.actual_qty || 0) - (bin.reserved_qty || 0);
 					});
 
-					results.forEach((rw) => {
+					results_mapped.forEach((rw) => {
 						const available = bins[rw.value] || 0;
 						const tr = $(`
-                            <tr data-item-code="${
+							<tr data-item-code="${
 								rw.value
 							}" style="border-bottom:1px solid #e0e0e0;" onmouseover="this.style.backgroundColor='#f9f9f9';" onmouseout="this.style.backgroundColor='transparent';">
-                                <td style="padding:8px;border:1px solid #d1d8dd;">${rw.value}</td>
-                                <td style="padding:8px;border:1px solid #d1d8dd;">${frappe.utils.escape_html(
+								<td style="padding:8px;border:1px solid #d1d8dd;">${rw.value}</td>
+								<td style="padding:8px;border:1px solid #d1d8dd;">${frappe.utils.escape_html(
 									rw.description || rw.value,
 								)}</td>
-                                <td style="padding:8px;border:1px solid #d1d8dd;">${available.toFixed(
-									2,
-								)}</td>
-                                <td style="padding:8px;border:1px solid #d1d8dd;"><input type="number" class="multi-qty" step="0.001" value="0" style="width:100%;padding:4px 6px;height:28px;font-size:12px;box-sizing:border-box;border:1px solid #d1d8dd;border-radius:3px;"></td>
-                            </tr>
-                        `);
+								<td style="padding:8px;border:1px solid #d1d8dd;">${available.toFixed(2)}</td>
+								<td style="padding:8px;border:1px solid #d1d8dd;"><input type="number" class="multi-qty" step="1" min="0" value="0" style="width:100%;padding:4px 6px;height:28px;font-size:12px;box-sizing:border-box;border:1px solid #d1d8dd;border-radius:3px;"></td>
+							</tr>
+						`);
 						$tbody.append(tr);
 					});
+
+					// render pager (next/prev)
+					render_multi_pager(d, page, results.length);
 				},
 			});
 		},
 	});
+}
+
+function render_multi_pager(d, page, results_length) {
+	const $pager = $(d.body).find('.multi-pager');
+	if (!$pager.length) return;
+
+	const page_length = 10;
+	$pager.empty();
+
+	const $prev = $(`<button class="btn btn-default" style="margin-right:8px;">Prev</button>`);
+	const $next = $(`<button class="btn btn-default">Next</button>`);
+
+	if (page > 0) {
+		$prev.on('click', () => {
+			const txt = d.get_value('search');
+			const wh = d.get_value('warehouse');
+			const $tbody = d.get_field('results').$wrapper.find('tbody');
+			search_items_with_stock_for_native(txt, wh, $tbody, d, page - 1);
+		});
+		$pager.append($prev);
+	}
+
+	$pager.append(`<span style="margin:0 8px;">Page ${page + 1}</span>`);
+
+	// Show next only if we received a full page (likely more results)
+	if (results_length >= page_length) {
+		$next.on('click', () => {
+			const txt = d.get_value('search');
+			const wh = d.get_value('warehouse');
+			const $tbody = d.get_field('results').$wrapper.find('tbody');
+			search_items_with_stock_for_native(txt, wh, $tbody, d, page + 1);
+		});
+		$pager.append($next);
+	}
 }
 
 // ============================================
@@ -2815,6 +2902,9 @@ frappe.ui.form.on('Sales Order', {
 		if (frm.doc.order_type && frm.doc.selling_price_list !== frm.doc.order_type) {
 			frm.set_value('selling_price_list', frm.doc.order_type);
 		}
+
+		// Ensure item discount fields are enabled/disabled according to order_type
+		update_items_discount_editable(frm);
 	},
 
 	order_type: function (frm) {
@@ -2822,6 +2912,9 @@ frappe.ui.form.on('Sales Order', {
 		if (frm.doc.order_type) {
 			frm.set_value('selling_price_list', frm.doc.order_type);
 		}
+
+		// Toggle item discount editability when order_type changes
+		update_items_discount_editable(frm);
 	},
 });
 
@@ -2830,24 +2923,45 @@ frappe.ui.form.on('Sales Order', {
 // ============================================
 frappe.ui.form.on('Sales Order', {
 	refresh: function (frm) {
-		frm.set_value(
-			'custom_outstanding_amount',
-			Math.round((frm.doc.grand_total || 0) - (frm.doc.advance_paid || 0)),
-		);
+		update_custom_outstanding(frm);
 	},
 	grand_total: function (frm) {
-		frm.set_value(
-			'custom_outstanding_amount',
-			Math.round((frm.doc.grand_total || 0) - (frm.doc.advance_paid || 0)),
-		);
+		update_custom_outstanding(frm);
 	},
 	advance_paid: function (frm) {
-		frm.set_value(
-			'custom_outstanding_amount',
-			Math.round((frm.doc.grand_total || 0) - (frm.doc.advance_paid || 0)),
-		);
+		update_custom_outstanding(frm);
 	},
 });
+
+// Ensure outstanding updates immediately for drafts and updates display-only for submitted docs
+function update_custom_outstanding(frm) {
+	const val = Math.round((frm.doc.grand_total || 0) - (frm.doc.advance_paid || 0));
+
+	// If no change, nothing to do
+	const current = flt(frm.doc.custom_outstanding_amount || 0);
+	if (Math.abs(current - val) <= 0.01) return;
+
+	// If submitted, update client-side doc value and refresh the field display
+	if (frm.doc && frm.doc.docstatus === 1) {
+		try {
+			frm.doc.custom_outstanding_amount = val;
+			if (frm.refresh_field) frm.refresh_field('custom_outstanding_amount');
+			return;
+		} catch (e) {
+			// ignore
+		}
+		return;
+	}
+
+	// For drafts/new or dirty forms, set value so it persists
+	if (typeof frm.is_dirty === 'function' && (frm.is_dirty() || frm.doc.__islocal)) {
+		frm.set_value('custom_outstanding_amount', val);
+	} else {
+		// Silent update for clean docs
+		frm.doc.custom_outstanding_amount = val;
+		if (frm.refresh_field) frm.refresh_field('custom_outstanding_amount');
+	}
+}
 
 // ============================================
 // File 18: payment_entry_sales_order.js
@@ -3633,7 +3747,7 @@ frappe.ui.form.on('Sales Order', {
 
 				// Get employee discount limit
 				const employee_limit = await get_sales_person_employee_discount_limit(frm);
-				const allowed_limit = Math.max(max_discount, employee_limit);
+				const allowed_limit = (Number(max_discount) || 0) + (Number(employee_limit) || 0);
 
 				// Check if entered discount exceeds allowed limit
 				const entered_discount = +row.custom_discount_percentage || 0;
@@ -3643,6 +3757,8 @@ frappe.ui.form.on('Sales Order', {
 						item_code: row.item_code,
 						entered: entered_discount,
 						allowed: allowed_limit,
+						max_discount: max_discount,
+						employee_limit: employee_limit,
 					};
 				}
 			} catch (error) {
@@ -3656,20 +3772,19 @@ frappe.ui.form.on('Sales Order', {
 		const errors = validation_results.filter((r) => r !== null);
 
 		if (errors.length > 0) {
-			// Show immediate message before save for each item
-			const error_messages = errors.map((err) => {
-				return __('الصنف {0}: نسبة الخصم المدخلة ({1}%) - المسموح ({2}%)', [
-					err.item_code,
-					err.entered,
-					err.allowed,
-				]);
-			});
-
-			// Show message for each item with its allowed limit
+			// Show immediate detailed message before save for each item (product max, employee limit, total)
 			errors.forEach((err) => {
+				const prod = Number(err.max_discount) || 0;
+				const emp = Number(err.employee_limit) || 0;
+				const tot = Number(err.allowed) || prod + emp;
 				frappe.msgprint({
-					title: __('تحذير: نسبة الخصم تتجاوز المسموح'),
-					message: __('عفوا إجمالي نسبة الخصم المسموحه هي {0}%', [err.allowed]),
+					title: __('خصم غير مسموح'),
+					message: __('🚫 لا يمكن تخطي حدود الخصم: الصنف {0} - خصم المنتج {1}%، خصم الموظف {2}%، الإجمالي المسموح {3}%', [
+						err.item_code || '',
+						prod,
+						emp,
+						tot,
+					]),
 					indicator: 'red',
 				});
 			});
@@ -4080,28 +4195,26 @@ frappe.ui.form.on('Sales Order', {
 			});
 
 			const available_map = {};
-			(bin_data || []).forEach((b) => {
-				const actual = b.actual_qty || 0;
-				const reserved = b.reserved_qty || 0;
-				available_map[b.item_code] = actual - reserved;
+			(b.message || []).forEach((bin) => {
+				bins[bin.item_code] = (bin.actual_qty || 0) - (bin.reserved_qty || 0);
 			});
 
-			// Calculate total required quantity
+			results_mapped.forEach((rw) => {
+				const available = bins[rw.value] || 0;
+				const tr = $(`
 			const total_required = {};
-			(quotation.items || []).forEach((item) => {
-				if (item.warehouse && item.warehouse !== target_warehouse) {
-					total_required[item.item_code] =
-						(total_required[item.item_code] || 0) + item.qty;
-				}
+								${rw.value}
+							}" style="border-bottom:1px solid #e0e0e0;" onmouseover="this.style.backgroundColor='#f9f9f9';" onmouseout="this.style.backgroundColor='transparent';">
+								<td style="padding:8px;border:1px solid #d1d8dd;">${rw.value}</td>
+								<td style="padding:8px;border:1px solid #d1d8dd;">${frappe.utils.escape_html(
+									rw.description || rw.value,
+								)}</td>
+								<td style="padding:8px;border:1px solid #d1d8dd;">${available.toFixed(2)}</td>
+								<td style="padding:8px;border:1px solid #d1d8dd;"><input type="number" class="multi-qty" step="0.001" value="0" style="width:100%;padding:4px 6px;height:28px;font-size:12px;box-sizing:border-box;border:1px solid #d1d8dd;border-radius:3px;"></td>
+							</tr>
+						`);
+				$tbody.append(tr);
 			});
-
-			// Calculate remaining shortage
-			const shortage_map = {};
-			Object.keys(total_required).forEach((item_code) => {
-				const available = available_map[item_code] || 0;
-				shortage_map[item_code] = Math.max(total_required[item_code] - available, 0);
-			});
-
 			// Distribute shortage across warehouses
 			const warehouse_groups = {};
 			(quotation.items || []).forEach((item) => {
@@ -4276,8 +4389,123 @@ function init_strict_colors(frm) {
 				grid_row.grid.df.fieldname === 'items'
 			) {
 				color_single_row(grid_row);
+				// Also enforce insurance-related disabling when rows render
+				apply_insurance_disable_on_row(frm, grid_row);
 			}
 		});
+	}
+}
+
+// Disable/enable discount fields on a single grid row when order_type is Insurance
+function apply_insurance_disable_on_row(frm, grid_row) {
+	try {
+		if (!grid_row || !grid_row.row) return;
+
+		const is_insurance = frm.doc && frm.doc.order_type === 'Insurance';
+
+		// Find the DOM wrapper for this row
+		const $row = grid_row.wrapper ? $(grid_row.wrapper) : $(grid_row.row);
+		if (!$row || !$row.length) return;
+
+		// For safety, look for elements with data-fieldname attribute inside the row
+		['custom_discount_percentage', 'custom_discount'].forEach(function (fname) {
+			// find cell or control
+			const $cell = $row.find(`[data-fieldname="${fname}"]`);
+			if ($cell && $cell.length) {
+				$cell
+					.find('input,select,textarea')
+					.prop('disabled', is_insurance)
+					.prop('readonly', is_insurance);
+			} else {
+				// fallback: try to find by input name attribute
+				$row.find(`input[name='${fname}'], input[data-fieldname='${fname}']`)
+					.prop('disabled', is_insurance)
+					.prop('readonly', is_insurance);
+			}
+		});
+	} catch (e) {
+		console.warn('[sales_order] apply_insurance_disable_on_row error', e);
+	}
+}
+
+// Update all existing item rows to enable/disable discount fields based on order_type
+function update_items_discount_editable(frm) {
+	try {
+		const is_insurance = frm.doc && frm.doc.order_type === 'Insurance';
+		if (!frm.fields_dict['items']) return;
+
+		const grid = frm.fields_dict['items'].grid;
+
+		// Iterate current rows: apply disabling and clear values when switching to Insurance
+		(frm.doc.items || []).forEach(function (row) {
+			let grid_row = null;
+			try {
+				if (grid && typeof grid.get_row === 'function') {
+					grid_row = grid.get_row(row.name);
+				}
+			} catch (e) {
+				grid_row = null;
+			}
+
+			if (grid_row) {
+				apply_insurance_disable_on_row(frm, grid_row);
+			}
+
+			if (is_insurance && row) {
+				const needs_clear_pct =
+					row.custom_discount_percentage && row.custom_discount_percentage !== 0;
+				const needs_clear_disc = row.custom_discount && row.custom_discount !== 0;
+
+				if (needs_clear_pct) {
+					if (frm.doc && frm.doc.docstatus === 1) {
+						// Submitted: clear display only
+						if (grid_row) {
+							try {
+								$(grid_row.row)
+									.find('[data-fieldname="custom_discount_percentage"] input')
+									.val('');
+							} catch (e) {}
+						}
+						row.custom_discount_percentage = 0;
+					} else {
+						// Draft/new: persist clear
+						try {
+							frappe.model.set_value(
+								row.doctype,
+								row.name,
+								'custom_discount_percentage',
+								0,
+							);
+						} catch (e) {
+							row.custom_discount_percentage = 0;
+						}
+					}
+				}
+
+				if (needs_clear_disc) {
+					if (frm.doc && frm.doc.docstatus === 1) {
+						if (grid_row) {
+							try {
+								$(grid_row.row)
+									.find('[data-fieldname="custom_discount"] input')
+									.val('');
+							} catch (e) {}
+						}
+						row.custom_discount = 0;
+					} else {
+						try {
+							frappe.model.set_value(row.doctype, row.name, 'custom_discount', 0);
+						} catch (e) {
+							row.custom_discount = 0;
+						}
+					}
+				}
+			}
+		});
+
+		// Also ensure future rows via grid-row-render handler (already hooked elsewhere)
+	} catch (e) {
+		console.warn('[sales_order] update_items_discount_editable error', e);
 	}
 }
 
@@ -4352,26 +4580,51 @@ function color_single_row(grid_row) {
 		}
 	});
 
-	// Fetch stock data for color coding (non-blocking)
+	// Fetch all bins for this item, then restrict to warehouses readable by current user
 	frappe.call({
 		method: 'frappe.client.get_list',
-		args: { doctype: 'Bin', filters: { item_code: row.item_code }, fields: ['projected_qty'] },
+		args: { doctype: 'Bin', filters: { item_code: row.item_code }, fields: ['warehouse', 'projected_qty'] },
 		callback: function (r) {
 			const bins = r.message || [];
-			const total_available = bins.reduce((sum, b) => sum + (b.projected_qty || 0), 0);
 
-			$cell.removeClass('strict-red strict-green strict-yellow');
-			let tooltip = `إجمالي المطلوب: ${total_required_qty}\nمتاح بالمخزن: ${available_in_wh}\nإجمالي بالشركة: ${total_available}`;
+			// Collect distinct warehouse names from bins
+			const warehouses = Array.from(new Set(bins.map((b) => b.warehouse).filter(Boolean)));
 
-			if (total_required_qty <= available_in_wh) $cell.addClass('strict-green');
-			else if (total_required_qty > available_in_wh && total_available >= total_required_qty)
-				$cell.addClass('strict-yellow');
-			else {
+			if (!warehouses.length) {
+				$cell.removeClass('strict-red strict-green strict-yellow');
 				$cell.addClass('strict-red');
-				tooltip = 'الصنف غير متوفر بالشركة';
+				$cell.attr('title', `إجمالي المطلوب: ${total_required_qty}\nمتاح بالمخزن: ${available_in_wh}\nلا توجد مخازن متاحة للمستخدم`);
+				return;
 			}
 
-			$cell.attr('title', tooltip);
+			// Ask server which of these warehouses the current user can read.
+			frappe.call({
+				method: 'frappe.client.get_list',
+				args: { doctype: 'Warehouse', filters: { name: ['in', warehouses] }, fields: ['name'] },
+				callback: function (wres) {
+					const allowed_wh = (wres.message || []).map((w) => w.name);
+
+					// Filter bins to only allowed warehouses
+					const bins_allowed = bins.filter((b) => allowed_wh.includes(b.warehouse));
+
+					const total_available_allowed = bins_allowed.reduce((sum, b) => sum + (b.projected_qty || 0), 0);
+					const available_in_selected_wh = bins_allowed.find((b) => b.warehouse === row.warehouse)?.projected_qty || 0;
+
+					$cell.removeClass('strict-red strict-green strict-yellow');
+					let tooltip = `إجمالي المطلوب: ${total_required_qty}\nمتاح بالمخزن: ${available_in_wh}\nمتاح في المخازن المسموحه: ${total_available_allowed}`;
+
+					if (total_required_qty <= available_in_selected_wh) {
+						$cell.addClass('strict-green');
+					} else if (total_required_qty > available_in_selected_wh && total_available_allowed >= total_required_qty) {
+						$cell.addClass('strict-yellow');
+					} else {
+						$cell.addClass('strict-red');
+						tooltip = `الصنف غير متوفر في المخازن المسموحه للمستخدم (المطلوب ${total_required_qty})`;
+					}
+
+					$cell.attr('title', tooltip);
+				},
+			});
 		},
 	});
 }
@@ -4794,7 +5047,48 @@ frappe.ui.form.on('Sales Order Item', {
 
 frappe.ui.form.on('Sales Order', {
 	onload: function (frm) {
+		// Ensure total deduction is correct on load
 		update_total_deduction(frm);
+
+		// Monkey-patch frm.set_value so that when the document is submitted
+		// we only update the displayed value (do not mutate frm.doc or mark
+		// the form dirty). This prevents auto-updates after save requiring
+		// an extra manual save.
+		if (!frm.__safe_set_patched) {
+			frm._orig_set_value = frm.set_value && frm.set_value.bind(frm);
+			frm.set_value = function (fieldOrObject, value) {
+				if (frm.doc && frm.doc.docstatus === 1) {
+					const setDisplay = function (f, v) {
+						try {
+							const field = frm.get_field && frm.get_field(f);
+							if (field && field.$wrapper) {
+								const display = field.$wrapper.find('.control-value');
+								if (display && display.length) {
+									display.text(typeof v === 'number' ? flt(v).toFixed(2) : v);
+									return;
+								}
+							}
+							frm.doc[f] = v;
+							if (frm.refresh_field) frm.refresh_field(f);
+						} catch (e) {
+							// ignore
+						}
+					};
+
+					if (typeof fieldOrObject === 'string') {
+						setDisplay(fieldOrObject, value);
+					} else if (typeof fieldOrObject === 'object') {
+						Object.keys(fieldOrObject).forEach(function (k) {
+							setDisplay(k, fieldOrObject[k]);
+						});
+					}
+					return Promise.resolve();
+				}
+				// For drafts/new/unsaved forms, call original set_value
+				return frm._orig_set_value(fieldOrObject, value);
+			};
+			frm.__safe_set_patched = true;
+		}
 	},
 	refresh: function (frm) {
 		// Only update in refresh if document is already dirty or is new
@@ -4815,37 +5109,37 @@ function update_total_deduction(frm) {
 
 	// Only update if value has changed to prevent marking document as dirty
 	let current_value = flt(frm.doc.custom_total_deduction || 0);
-	if (Math.abs(current_value - total_deduction) > 0.01) {
-		// If document is submitted, do NOT mutate frm.doc (this would be posted to server
-		// on any subsequent save and can trigger UpdateAfterSubmit errors). Update
-		// the displayed value only.
-		if (frm.doc) {
-			try {
-				const field = frm.get_field && frm.get_field('custom_total_deduction');
-				if (field && field.$wrapper) {
-					const display = field.$wrapper.find('.control-value');
-					if (display && display.length) {
-						display.text(flt(total_deduction).toFixed(2));
-					} else {
-						frm.refresh_field && frm.refresh_field('custom_total_deduction');
-					}
+	if (Math.abs(current_value - total_deduction) <= 0.01) {
+		return;
+	}
+
+	// If document is submitted, update display only (do not mutate frm.doc)
+	if (frm.doc && frm.doc.docstatus === 1) {
+		try {
+			const field = frm.get_field && frm.get_field('custom_total_deduction');
+			if (field && field.$wrapper) {
+				const display = field.$wrapper.find('.control-value');
+				if (display && display.length) {
+					display.text(flt(total_deduction).toFixed(2));
 				} else {
 					frm.refresh_field && frm.refresh_field('custom_total_deduction');
 				}
-			} catch (e) {
-				// ignore display errors
+			} else {
+				frm.refresh_field && frm.refresh_field('custom_total_deduction');
 			}
-			return;
+		} catch (e) {
+			// ignore display errors
 		}
+		return;
+	}
 
-		// Use frappe.model.set_value to avoid triggering dirty state unnecessarily
-		// Only if document is already dirty or new
-		if (frm.doi) {
-			frm.set_value('custom_total_deduction', total_deduction);
-		} else {
-			// For clean documents, update silently without marking as dirty
-			frm.doc.custom_total_deduction = total_deduction;
-		}
+	// For drafts or dirty forms, set value so it persists.
+	if (typeof frm.is_dirty === 'function' && (frm.is_dirty() || frm.doc.__islocal)) {
+		frm.set_value('custom_total_deduction', total_deduction);
+	} else {
+		// For clean documents, update silently without marking as dirty
+		frm.doc.custom_total_deduction = total_deduction;
+		if (frm.refresh_field) frm.refresh_field('custom_total_deduction');
 	}
 }
 
@@ -4894,11 +5188,25 @@ frappe.ui.form.on('Sales Order Item', {
 	qty: function (frm, cdt, cdn) {
 		recalc_row_and_total(frm, cdt, cdn);
 	},
+	// When item is changed (product change), recalc using available price/rate
+	item_code: function (frm, cdt, cdn) {
+		// small timeout to allow Frappe to populate rate/price_list_rate
+		setTimeout(() => recalc_row_and_total(frm, cdt, cdn), 50);
+	},
+	item_name: function (frm, cdt, cdn) {
+		setTimeout(() => recalc_row_and_total(frm, cdt, cdn), 50);
+	},
+	rate: function (frm, cdt, cdn) {
+		// rate may be set/changed by pricing rules -> recalc
+		recalc_row_and_total(frm, cdt, cdn);
+	},
 });
 
 function recalc_row_and_total(frm, cdt, cdn) {
 	let row = frappe.get_doc(cdt, cdn);
-	row.custom_total_price_list = (row.price_list_rate || 0) * (row.qty || 0);
+	// Prefer price_list_rate but fall back to rate when price_list_rate is not provided
+	const unit_price = row.price_list_rate || row.rate || 0;
+	row.custom_total_price_list = unit_price * (row.qty || 0);
 
 	let total = 0;
 	(frm.doc.items || []).forEach((r) => {
@@ -4913,19 +5221,12 @@ function _update_custom_total_table(frm, total) {
 	const current = flt(frm.doc.custom_total_table || 0);
 	if (Math.abs(current - total) <= 0.01) return;
 
-	// If submitted - update display only to avoid sending changes to server
+	// If submitted - update client-side doc value and refresh the field display
 	if (frm.doc && frm.doc.docstatus === 1) {
 		try {
-			const field = frm.get_field && frm.get_field('custom_total_table');
-			if (field && field.$wrapper) {
-				const display = field.$wrapper.find('.control-value');
-				if (display && display.length) {
-					display.text(flt(total).toFixed(2));
-					return;
-				}
-			}
-			// fallback
-			frm.refresh_field && frm.refresh_field('custom_total_table');
+			frm.doc.custom_total_table = total;
+			if (frm.refresh_field) frm.refresh_field('custom_total_table');
+			return;
 		} catch (e) {
 			// ignore
 		}
@@ -4940,6 +5241,32 @@ function _update_custom_total_table(frm, total) {
 		if (frm.refresh_field) frm.refresh_field('custom_total_table');
 	}
 }
+
+// Recompute custom table total from all rows (robust fallback values)
+function compute_custom_total_table(frm) {
+	let total = 0;
+	(frm.doc.items || []).forEach((row) => {
+		const qty = flt(row.qty || 0);
+		const unit = flt(
+			row.price_list_rate || row.rate || (row.amount && qty ? row.amount / qty : 0) || 0,
+		);
+		total += unit * qty;
+	});
+	_update_custom_total_table(frm, total);
+}
+
+// Ensure totals update when items table changes or on refresh/after_save
+frappe.ui.form.on('Sales Order', {
+	items_on_change: function (frm) {
+		compute_custom_total_table(frm);
+	},
+	refresh: function (frm) {
+		compute_custom_total_table(frm);
+	},
+	after_save: function (frm) {
+		compute_custom_total_table(frm);
+	},
+});
 
 // ========================= إعدادات عامة =========================
 
@@ -4978,7 +5305,8 @@ frappe.ui.form.on('Sales Order', {
 		}
 
 		// نضيف الزرار كل مرة
-		frm.eye_btn = frm.add_custom_button(__('الكشف الطبي (Eye Prescription)'), function () {
+		frm.eye_btn = frm
+			.add_custom_button(__('الكشف الطبي (Eye Prescription)'), function () {
 				if (!frm.doc.customer) {
 					frappe.msgprint({
 						title: __('تنبيه'),
@@ -5280,7 +5608,17 @@ function save_new_exam(frm, dialog) {
 		},
 		callback(r) {
 			const customer = r.message;
-			if (!customer) return;
+			if (!customer) {
+				// If customer record cannot be loaded, still link the exam to Sales Order child and close dialog
+				try {
+					link_exam_to_sales_order_child(frm, exam, dialog.custom_eye_col_map);
+					render_order_exam_table(frm, dialog);
+				} catch (err) {
+					console.error('linking exam to SO failed (no customer)', err);
+				}
+				dialog.hide();
+				return;
+			}
 
 			const target_field = dialog.custom_eye_table_field || CUSTOMER_EXAMS_CHILD_FIELD;
 			const FN = dialog.custom_eye_col_map || EYE_EXAM_FIELDNAMES;
@@ -5334,11 +5672,10 @@ function save_new_exam(frm, dialog) {
 					},
 				});
 			} else {
-				frappe.msgprint({
-					title: __('تم الربط'),
-					message: __('الكشف موجود بالفعل في ملف العميل، وتم اعتماده في أمر البيع.'),
-					indicator: 'green',
-				});
+				// Duplicate found in customer records — continue silently and link to order
+				console.info(
+					'Eye exam duplicate detected in customer record; linking to sales order silently.',
+				);
 				finish_save();
 			}
 
@@ -5357,6 +5694,9 @@ function save_new_exam(frm, dialog) {
 
 				// Reload previous exams for the dialog
 				load_previous_eye_exams(frm, dialog);
+
+				// Close the dialog after successful save
+				dialog.hide();
 			}
 		},
 		error(err) {
@@ -5370,6 +5710,8 @@ function save_new_exam(frm, dialog) {
 			// حتى لو فشل حفظه في العميل، نحتفظ به على مستوى أمر البيع فقط
 			link_exam_to_sales_order_child(frm, exam, dialog.custom_eye_col_map);
 			render_order_exam_table(frm, dialog);
+			// Close the dialog as well (we linked locally)
+			dialog.hide();
 		},
 	});
 }
@@ -5656,40 +5998,93 @@ async function open_lens_po_dialog(frm) {
 
 	const rows = [];
 
+	// First: detect lens items in the Sales Order and aggregate duplicates
+	const rowsMap = {};
+	for (const r of so_items) {
+		if (!r.item_code) continue;
+
+		const item_group = await frappe.db
+			.get_value('Item', r.item_code, 'item_group')
+			.then((res) => res.message?.item_group || '')
+			.catch(() => '');
+
+		const ig = (item_group || '').toLowerCase();
+		if (!/eyeglasses.*lens/.test(ig)) continue;
+
+		const pending = r.pending_qty != null ? r.pending_qty || 0 : r.qty || 0;
+		if (pending <= 0) continue;
+
+		const key = r.item_code;
+		if (!rowsMap[key]) {
+			rowsMap[key] = {
+				__checked: 1,
+				so_details: [r.name],
+				item_code: r.item_code,
+				item_name: r.item_name,
+				item_group: item_group,
+				pending_qty: pending,
+				qty: pending,
+				warehouse: so_wh,
+			};
+		} else {
+			// aggregate quantities and sales order item links
+			rowsMap[key].pending_qty = (rowsMap[key].pending_qty || 0) + pending;
+			rowsMap[key].qty = (rowsMap[key].qty || 0) + pending;
+			rowsMap[key].so_details.push(r.name);
+		}
+	}
+
+	// Convert map to rows array; join so_details into comma-separated string for grid
+	for (const k in rowsMap) {
+		const entry = rowsMap[k];
+		entry.so_detail = Array.isArray(entry.so_details)
+			? entry.so_details.join(',')
+			: entry.so_details || '';
+		delete entry.so_details;
+		rows.push(entry);
+	}
+
+	if (!rows.length) {
+		frappe.msgprint({
+			title: __('لا يوجد عدسات'),
+			message:
+				'<div style="color:#d9534f;font-weight:600;">لا يوجد عدسات لعمل طلب شراء.</div>',
+			indicator: 'orange',
+		});
+		return; // do not open eye dialog
+	}
+
 	// Validate that an eye prescription exists on the Sales Order before creating PO
 	try {
 		let has_exam = false;
 		// check child table (if configured)
 		const fn = ORDER_EXAMS_CHILD_FIELD;
 		if (fn && Array.isArray(frm.doc[fn]) && frm.doc[fn].length) {
-			// check at least one meaningful value in the first row
 			const r = frm.doc[fn][0] || {};
 			for (const k of Object.values(EYE_EXAM_FIELDNAMES)) {
-				if (r[k]) { has_exam = true; break; }
+				if (r[k]) {
+					has_exam = true;
+					break;
+				}
 			}
 		}
 		// fallback: check top-level fields mapped to eye exam
 		if (!has_exam) {
 			for (const k of Object.values(EYE_EXAM_FIELDNAMES)) {
-				if (frm.doc[k]) { has_exam = true; break; }
+				if (frm.doc[k]) {
+					has_exam = true;
+					break;
+				}
 			}
 		}
 		if (!has_exam) {
-				// fallback: check Customer's stored exams that reference this Sales Order
-				if (frm.doc.customer) {
-					try {
-						const cust_exams = await frappe.db.get_list('Eye Prescription', {
-							filters: { parent: frm.doc.customer, so: frm.doc.name },
-							fields: ['name'],
-						}).catch(() => []);
-						if ((cust_exams || []).length) has_exam = true;
-					} catch (e) {
-						console.error('customer exam lookup failed', e);
-					}
-				}
-
-			frappe.msgprint({ title: __('Missing Eye Prescription'), message: __('برجاء ادخال كشف النظر في أمر البيع قبل إنشاء طلب الشراء.'), indicator: 'red' });
-			// open the eye prescription dialog so user can enter it immediately
+			// Require the exam to exist on the Sales Order itself (do NOT accept customer-level exams)
+			frappe.msgprint({
+				title: __('كشف النظر مفقود'),
+				message:
+					'<div style="color:#d9534f;font-weight:600;">برجاء ادخال كشف النظر في أمر البيع قبل إنشاء طلب الشراء.</div>',
+				indicator: 'red',
+			});
 			try {
 				open_eye_dialog(frm);
 			} catch (e) {
@@ -5710,44 +6105,16 @@ async function open_lens_po_dialog(frm) {
 		console.error('localStorage read failed', e);
 	}
 
-	for (const r of so_items) {
-		if (!r.item_code) continue;
-
-		const item_group = await frappe.db
-			.get_value('Item', r.item_code, 'item_group')
-			.then((res) => res.message?.item_group || '')
-			.catch(() => '');
-
-		const ig = (item_group || '').toLowerCase();
-		if (!/eyeglasses.*lens/.test(ig)) continue;
-
-		const pending = r.pending_qty != null ? r.pending_qty || 0 : r.qty || 0;
-		if (pending <= 0) continue;
-
-		rows.push({
-			__checked: 1,
-			so_detail: r.name,
-			item_code: r.item_code,
-			item_name: r.item_name,
-			item_group: item_group,
-			pending_qty: pending,
-			qty: pending,
-			warehouse: so_wh,
-		});
-	}
-
-	if (!rows.length) {
-		frappe.msgprint(__('No allowed items found (Item Group must contain "Eyeglasses" and "Lens").'));
-		return;
-	}
+	// (rows already populated from aggregated rowsMap above)
 
 	// Find existing Purchase Orders that reference this Sales Order via Purchase Order Item.sales_order
 	let po_items = [];
 	try {
-		po_items = await frappe.db.get_list('Purchase Order Item', {
-			filters: { sales_order: frm.doc.name },
-			fields: ['parent', 'sales_order_item']
+		const res = await frappe.call({
+			method: 'aljamil_customizations.api.get_po_items',
+			args: { params: { sales_order: frm.doc.name } },
 		});
+		po_items = res.message || [];
 	} catch (e) {
 		po_items = [];
 	}
@@ -5764,20 +6131,32 @@ async function open_lens_po_dialog(frm) {
 	// Search Purchase Orders in same company & warehouse that contain any of the lens item codes.
 	if (!existing_po_parents.length) {
 		try {
-			const item_codes = rows.map(r => r.item_code).filter(Boolean);
+			const item_codes = rows.map((r) => r.item_code).filter(Boolean);
 			if (item_codes.length) {
-				const candidate_pos = await frappe.db.get_list('Purchase Order', {
-					filters: { company: frm.doc.company, set_warehouse: so_wh },
-					fields: ['name']
-				}).catch(() => []);
+				const po_names_res = await frappe.db
+					.get_list('Purchase Order', {
+						filters: { company: frm.doc.company, set_warehouse: so_wh },
+						fields: ['name'],
+					})
+					.catch(() => []);
 
-				const po_names = (candidate_pos || []).map(p => p.name).filter(Boolean);
+				const po_names = (po_names_res || []).map((p) => p.name).filter(Boolean);
 				if (po_names.length) {
-					// find any PO Item that matches these item codes
-					const po_items_by_code = await frappe.db.get_list('Purchase Order Item', {
-						filters: [ ['parent', 'in', po_names], ['item_code', 'in', item_codes] ],
-						fields: ['parent', 'item_code']
-					}).catch(() => []);
+					// find any PO Item that matches these item codes via server helper
+					const by_code_res = await frappe
+						.call({
+							method: 'aljamil_customizations.api.get_po_items',
+							args: {
+								params: {
+									company: frm.doc.company,
+									set_warehouse: so_wh,
+									item_codes: item_codes,
+								},
+							},
+						})
+						.catch(() => ({ message: [] }));
+
+					const po_items_by_code = by_code_res.message || [];
 
 					for (const pi of po_items_by_code || []) {
 						if (!pi.parent) continue;
@@ -5800,24 +6179,44 @@ async function open_lens_po_dialog(frm) {
 
 	// Helper to show a PO actions dialog (Submit / Cancel / Receive)
 	const show_po_actions = async (po_name) => {
-		const po_info = await frappe.db.get_value('Purchase Order', po_name, ['name', 'docstatus', 'status', 'per_received']).catch(() => null);
-		const status = po_info?.message?.status || (po_info?.message?.docstatus == 0 ? 'Draft' : po_info?.message?.docstatus == 1 ? 'Submitted' : 'Cancelled');
+		const po_info = await frappe.db
+			.get_value('Purchase Order', po_name, ['name', 'docstatus', 'status', 'per_received'])
+			.catch(() => null);
+		const status =
+			po_info?.message?.status ||
+			(po_info?.message?.docstatus == 0
+				? 'Draft'
+				: po_info?.message?.docstatus == 1
+				? 'Submitted'
+				: 'Cancelled');
 		const per_received = po_info?.message?.per_received || 0;
 
 		const exd = new frappe.ui.Dialog({
 			title: __('Purchase Order'),
-			fields: [ { fieldname: 'po_html', fieldtype: 'HTML', label: __('Purchase Order') } ],
+			fields: [{ fieldname: 'po_html', fieldtype: 'HTML', label: __('Purchase Order') }],
 			primary_action_label: __('Submit'),
 			primary_action: async () => {
 				try {
 					frappe.dom.freeze(__('Submitting Purchase Order...'));
 					// fetch latest PO document before submitting to avoid TimestampMismatchError
-					const latest_po = await frappe.call({ method: 'frappe.client.get', args: { doctype: 'Purchase Order', name: po_name } }).catch(() => null);
+					const latest_po = await frappe
+						.call({
+							method: 'frappe.client.get',
+							args: { doctype: 'Purchase Order', name: po_name },
+						})
+						.catch(() => null);
 					if (latest_po && latest_po.message) {
-						await frappe.call({ method: 'frappe.client.submit', args: { doc: latest_po.message } });
+						await frappe.call({
+							method: 'frappe.client.submit',
+							args: { doc: latest_po.message },
+						});
 						frappe.msgprint(__('Purchase Order submitted.'));
 					} else {
-						frappe.msgprint(__('Could not fetch Purchase Order for submit. Refresh and try again.'));
+						frappe.msgprint(
+							__(
+								'Could not fetch Purchase Order for submit. Refresh and try again.',
+							),
+						);
 					}
 					exd.hide();
 				} catch (err) {
@@ -5829,27 +6228,51 @@ async function open_lens_po_dialog(frm) {
 			secondary_action_label: __('Cancel PO'),
 			secondary_action: async () => {
 				try {
+					// Refresh latest PO info before attempting cancel
+					const latest = await frappe
+						.call({
+							method: 'frappe.client.get',
+							args: { doctype: 'Purchase Order', name: po_name },
+						})
+						.catch(() => null);
+					const per_received = latest?.message?.per_received || 0;
+					if (per_received > 0) {
+						frappe.msgprint({
+							title: __('Cannot Cancel'),
+							message: __(
+								'This Purchase Order has received items and cannot be cancelled.',
+							),
+							indicator: 'red',
+						});
+						return;
+					}
 					frappe.dom.freeze(__('Cancelling Purchase Order...'));
-					await frappe.call({ method: 'frappe.client.cancel', args: { doctype: 'Purchase Order', name: po_name } });
+					await frappe.call({
+						method: 'frappe.client.cancel',
+						args: { doctype: 'Purchase Order', name: po_name },
+					});
 					frappe.msgprint(__('Purchase Order cancelled.'));
-					try { localStorage.removeItem(`aljamil_last_po_for_so:${frm.doc.name}`); } catch (e) {}
+					try {
+						localStorage.removeItem(`aljamil_last_po_for_so:${frm.doc.name}`);
+					} catch (e) {}
 					exd.hide();
 				} catch (err) {
 					frappe.msgprint(__('Could not cancel Purchase Order.'));
 				} finally {
 					frappe.dom.unfreeze();
 				}
-			}
+			},
 		});
 
 		exd.fields_dict.po_html.$wrapper.html(`<div>
 			<a href="/app/purchase-order/${po_name}" target="_blank">${po_name}</a>
 			<div>${__('Status')}: ${status}</div>
-			<div style="margin-top:8px;"><button class="btn btn-primary btn-sm" id="receive_pr">${__('Receive (Create Purchase Receipt)')}</button></div>
 		</div>`);
 
 		// blur active element to avoid aria-hidden focus issues when hiding previous modal
-		try { document.activeElement && document.activeElement.blur && document.activeElement.blur(); } catch(e) {}
+		try {
+			document.activeElement && document.activeElement.blur && document.activeElement.blur();
+		} catch (e) {}
 		// give browser a moment to apply blur before showing new modal
 		await new Promise((res) => setTimeout(res, 50));
 		exd.show();
@@ -5866,77 +6289,42 @@ async function open_lens_po_dialog(frm) {
 
 			// if something has been received, disable Cancel and Receive
 			if ((po_info?.message?.per_received || 0) > 0) {
-				const cancelBtn = exd.$wrapper.find('.modal-footer button:contains("' + __('Cancel PO') + '")');
-				if (cancelBtn && cancelBtn.length) cancelBtn.prop('disabled', true).addClass('disabled');
+				const cancelBtn = exd.$wrapper.find(
+					'.modal-footer button:contains("' + __('Cancel PO') + '")',
+				);
+				if (cancelBtn && cancelBtn.length)
+					cancelBtn.prop('disabled', true).addClass('disabled');
 				// disable in-dialog receive button
 				exd.$wrapper.find('#receive_pr').prop('disabled', true).addClass('disabled');
 				// also footer receive
-				exd.$wrapper.find('#receive_pr_footer').prop('disabled', true).addClass('disabled');
+				exd.$wrapper
+					.find('#receive_pr_footer')
+					.prop('disabled', true)
+					.addClass('disabled');
 			}
 		} catch (e) {
 			console.error('Could not adjust dialog buttons for PO status', e);
 		}
 
-		// add a 'Receive' button in the dialog footer next to other actions
-		try {
-			const footer = exd.$wrapper.find('.modal-footer');
-			if (footer && footer.length) {
-				const receive_btn = $("<button class='btn btn-default btn-sm' id='receive_pr_footer'></button>").text(__('Receive (Create Purchase Receipt)'));
-				footer.append(receive_btn);
-				footer.on('click', '#receive_pr_footer', async () => {
-					exd.$wrapper.find('#receive_pr').trigger('click');
-				});
-			}
-		} catch (e) {
-			console.error('Could not inject footer receive button', e);
-		}
-
-		exd.$wrapper.on('click', '#receive_pr', async () => {
-			try {
-				frappe.dom.freeze(__('Creating Purchase Receipt...'));
-				const mapped = await frappe.call({ method: 'erpnext.buying.doctype.purchase_order.purchase_order.make_purchase_receipt', args: { source_name: po_name } });
-				let pr_doc = mapped.message;
-				if (!pr_doc) {
-					frappe.msgprint(__('Could not map Purchase Order to Purchase Receipt.'));
-					return;
-				}
-
-				// Ensure warehouse on items uses Sales Order warehouse
-				for (const it of pr_doc.items || []) {
-					it.warehouse = so_wh;
-				}
-
-				const ins = await frappe.call({ method: 'frappe.client.insert', args: { doc: pr_doc } });
-				const pr_doc_saved = ins.message;
-				if (pr_doc_saved && pr_doc_saved.name) {
-					// fetch latest PR before submit
-					const latest_pr = await frappe.call({ method: 'frappe.client.get', args: { doctype: 'Purchase Receipt', name: pr_doc_saved.name } }).catch(() => null);
-					if (latest_pr && latest_pr.message) {
-						await frappe.call({ method: 'frappe.client.submit', args: { doc: latest_pr.message } });
-						frappe.msgprint({ title: __('Purchase Receipt Created & Submitted'), message: `<a href="/app/purchase-receipt/${pr_doc_saved.name}" target="_blank">${pr_doc_saved.name}</a>` });
-					} else {
-						frappe.msgprint(__('Could not fetch Purchase Receipt for submit.'));
-					}
-				}
-				exd.hide();
-			} catch (err) {
-				console.error(err);
-				frappe.msgprint(__('Error creating Purchase Receipt.'));
-			} finally {
-				frappe.dom.unfreeze();
-			}
-		});
+		// Note: 'Receive' functionality removed per request (no auto-receive from dialog)
 	};
 
 	// If we stored a preferred PO name for this Sales Order (localStorage), open it first
 	if (prefer_po_name) {
 		try {
-			const exists = await frappe.call({ method: 'frappe.client.get', args: { doctype: 'Purchase Order', name: prefer_po_name } }).catch(() => null);
+			const exists = await frappe
+				.call({
+					method: 'frappe.client.get',
+					args: { doctype: 'Purchase Order', name: prefer_po_name },
+				})
+				.catch(() => null);
 			if (exists && exists.message) {
 				await show_po_actions(prefer_po_name);
 				return;
 			} else {
-				try { localStorage.removeItem(`aljamil_last_po_for_so:${frm.doc.name}`); } catch (e) {}
+				try {
+					localStorage.removeItem(`aljamil_last_po_for_so:${frm.doc.name}`);
+				} catch (e) {}
 			}
 		} catch (e) {
 			console.error('preferred PO open failed', e);
@@ -5946,10 +6334,14 @@ async function open_lens_po_dialog(frm) {
 	// If a Purchase Order already exists for this Sales Order (via PO Item link), inform user and link to PO list
 	if (existing_po_parents.length) {
 		try {
-			const link = `/app/purchase-order?Purchase+Order+Item.sales_order=${encodeURIComponent(frm.doc.name)}`;
+			const link = `/app/purchase-order?Purchase+Order+Item.sales_order=${encodeURIComponent(
+				frm.doc.name,
+			)}`;
 			frappe.msgprint({
 				title: __('Purchase Order Exists'),
-				message: `يوجد طلب شراء مُنشيء بالفعل. الرجاء مراجعته: <a href="${link}" target="_blank">${__('Open Purchase Orders')}</a>`
+				message: `يوجد طلب شراء مُنشيء بالفعل. الرجاء مراجعته: <a href="${link}" target="_blank">${__(
+					'Open Purchase Orders',
+				)}</a>`,
 			});
 		} catch (e) {
 			frappe.msgprint(__('Purchase Order already exists for this Sales Order.'));
@@ -6055,7 +6447,9 @@ async function open_lens_po_dialog(frm) {
 			const selected = table
 				.filter((r) => r.__checked && (r.qty || 0) > 0)
 				.map((r) => ({
-					so_detail: r.so_detail,
+					so_detail: Array.isArray(r.so_detail)
+						? r.so_detail.join(',')
+						: r.so_detail || '',
 					item_code: r.item_code,
 					qty: r.qty,
 				}));
@@ -6066,12 +6460,43 @@ async function open_lens_po_dialog(frm) {
 			}
 
 			// Prevent duplicate PO creation: if any selected sales_order_item already has a PO item, open that PO
-			const conflict = selected.find(s => existing_po_map && existing_po_map[s.so_detail]);
+			const conflict = selected.find((s) => {
+				// check by sales order item(s) or by item_code (fallback)
+				const so_list = (s.so_detail || '')
+					.toString()
+					.split(',')
+					.map((x) => x.trim())
+					.filter(Boolean);
+				if (existing_po_map) {
+					for (const sd of so_list) {
+						if (existing_po_map[sd]) return true;
+					}
+					if (existing_po_map[s.item_code]) return true;
+				}
+				return false;
+			});
 			if (conflict) {
-				const po_name = existing_po_map[conflict.so_detail];
+				// try to find a parent PO name for the conflicting key
+				let po_name = null;
+				const so_list = (conflict.so_detail || '')
+					.toString()
+					.split(',')
+					.map((x) => x.trim())
+					.filter(Boolean);
+				for (const sd of so_list) {
+					if (existing_po_map[sd]) {
+						po_name = existing_po_map[sd];
+						break;
+					}
+				}
+				if (!po_name && existing_po_map[conflict.item_code])
+					po_name = existing_po_map[conflict.item_code];
 				frappe.msgprint({
 					title: __('Existing Purchase Order'),
-					message: __('A Purchase Order already exists for one of the selected items: {0}. Opening it now.', [po_name])
+					message: __(
+						'A Purchase Order already exists for one of the selected items: {0}. Opening it now.',
+						[po_name],
+					),
 				});
 				await show_po_actions(po_name);
 				return;
@@ -6082,18 +6507,20 @@ async function open_lens_po_dialog(frm) {
 
 				const po_items = [];
 				for (const it of selected) {
-					const soRow = (frm.doc.items || []).find((r) => r.name === it.so_detail);
+					// If multiple sales order items were aggregated, pick the first as representative
+					const first_so = (it.so_detail || '').toString().split(',')[0] || '';
+					const soRow = (frm.doc.items || []).find((r) => r.name === first_so) || {};
 
 					po_items.push({
 						item_code: it.item_code,
 						qty: it.qty,
 						// ✅ مخزن السطر = set_warehouse
 						warehouse: so_wh,
-						uom: soRow?.uom,
-						schedule_date: soRow?.delivery_date || frm.doc.transaction_date,
-						rate: soRow?.rate || 0,
+						uom: soRow.uom,
+						schedule_date: soRow.delivery_date || frm.doc.transaction_date,
+						rate: soRow.rate || 0,
 						sales_order: frm.doc.name,
-						sales_order_item: it.so_detail,
+						sales_order_item: first_so,
 					});
 				}
 
@@ -6118,7 +6545,8 @@ async function open_lens_po_dialog(frm) {
 
 				// persist mapping so next time user opens PO dialog we show the created PO
 				try {
-					if (po_name) localStorage.setItem(`aljamil_last_po_for_so:${frm.doc.name}`, po_name);
+					if (po_name)
+						localStorage.setItem(`aljamil_last_po_for_so:${frm.doc.name}`, po_name);
 				} catch (e) {
 					console.error('localStorage write failed', e);
 				}
@@ -6128,12 +6556,27 @@ async function open_lens_po_dialog(frm) {
 				if (po_name) {
 					try {
 						frappe.dom.freeze(__('Submitting Purchase Order...'));
-						const latest_po = await frappe.call({ method: 'frappe.client.get', args: { doctype: 'Purchase Order', name: po_name } }).catch(() => null);
+						const latest_po = await frappe
+							.call({
+								method: 'frappe.client.get',
+								args: { doctype: 'Purchase Order', name: po_name },
+							})
+							.catch(() => null);
 						if (latest_po && latest_po.message) {
-							await frappe.call({ method: 'frappe.client.submit', args: { doc: latest_po.message } });
-							frappe.msgprint({ title: __('Purchase Order Created & Submitted'), message: `<a href="/app/purchase-order/${po_name}" target="_blank">${po_name}</a>` });
+							await frappe.call({
+								method: 'frappe.client.submit',
+								args: { doc: latest_po.message },
+							});
+							frappe.msgprint({
+								title: __('Purchase Order Created & Submitted'),
+								message: `<a href="/app/purchase-order/${po_name}" target="_blank">${po_name}</a>`,
+							});
 						} else {
-							frappe.msgprint(__('Purchase Order created but could not be auto-submitted. Refresh and submit manually.'));
+							frappe.msgprint(
+								__(
+									'Purchase Order created but could not be auto-submitted. Refresh and submit manually.',
+								),
+							);
 						}
 					} catch (err) {
 						console.error('Auto-submit PO failed', err);
@@ -6160,7 +6603,90 @@ async function open_lens_po_dialog(frm) {
 		},
 	});
 
-	try { document.activeElement && document.activeElement.blur && document.activeElement.blur(); } catch(e) {}
+	try {
+		document.activeElement && document.activeElement.blur && document.activeElement.blur();
+	} catch (e) {}
 	await new Promise((res) => setTimeout(res, 50));
 	d.show();
 }
+//update sales person in sales team table when custom_sales_person is changed
+// Sync `custom_sales_person` -> `sales_team` child table
+frappe.ui.form.on('Sales Order', {
+	custom_sales_person: function (frm) {
+		// Only modify child table for drafts/new documents
+		if (frm.doc && frm.doc.docstatus === 1) {
+			// Document is submitted — do not mutate server state
+			frappe.msgprint(__('Cannot change sales person on a submitted Sales Order.'));
+			return;
+		}
+
+		const sp = frm.doc.custom_sales_person;
+
+		// If cleared, remove all sales_team rows
+		if (!sp) {
+			frm.clear_table('sales_team');
+			frm.refresh_field('sales_team');
+			return;
+		}
+
+		// Reset sales_team and add a single row for the selected sales person
+		frm.clear_table('sales_team');
+		const row = frm.add_child('sales_team');
+		row.sales_person = sp;
+		row.allocated_percentage = 100;
+
+		// Refresh the table so UI shows the new row immediately
+		frm.refresh_field('sales_team');
+	},
+
+	validate: function (frm) {
+		// Ensure a single-row sales_team always has 100% allocation before save
+		if (frm.doc.sales_team && frm.doc.sales_team.length === 1) {
+			frm.doc.sales_team[0].allocated_percentage = 100;
+			frm.refresh_field('sales_team');
+		}
+	},
+});
+//
+frappe.ui.form.on('Sales Order', {
+	async validate(frm) {
+		let blocked = [];
+
+		for (let row of frm.doc.items || []) {
+			if (!row.item_code) continue;
+
+			// لازم مخزن
+			if (!row.warehouse) continue;
+
+			// هل الصنف stock item؟
+			const item = await frappe.db.get_value('Item', row.item_code, 'is_stock_item');
+			if (!item || !item.message) continue;
+
+			const is_stock_item = item.message.is_stock_item;
+
+			// لو مش stock item (يعني maintain stock OFF) سيبه يعدي
+			if (!is_stock_item) continue;
+
+			// هات الرصيد الفعلي في المخزن
+			const r = await frappe.call({
+				method: 'erpnext.stock.utils.get_latest_stock_qty',
+				args: { item_code: row.item_code, warehouse: row.warehouse },
+			});
+
+			const actual = flt(r.message || 0);
+			const needed = flt(row.qty || 0);
+
+			if (actual < needed) {
+				blocked.push(`${row.item_code} (المتاح: ${actual} / المطلوب: ${needed})`);
+			}
+		}
+
+		if (blocked.length) {
+			frappe.throw(
+				__('❌ لا يمكن إنشاء أمر بيع لأن الرصيد غير كافٍ للأصناف التالية:<br>{0}', [
+					blocked.join('<br>'),
+				]),
+			);
+		}
+	},
+});
