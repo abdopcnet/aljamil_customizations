@@ -161,11 +161,10 @@ doc_events = {
     "Sales Invoice": {
         "before_save": "aljamil_customizations.sales_invoice.send_discount_approval_notifications",
     },
-    # Journal Entry logic removed - Purchase Invoice will create GL entries instead
-    # "Landed Cost Voucher": {
-    #     "on_submit": "aljamil_customizations.landed_cost_voucher.create_expense_journal_entries",
-    #     "on_cancel": "aljamil_customizations.landed_cost_voucher.cancel_expense_journal_entries",
-    # },
+    "Landed Cost Voucher": {
+        "on_submit": "aljamil_customizations.landed_cost_voucher.update_purchase_invoice_allocated_costs",
+        "on_cancel": "aljamil_customizations.landed_cost_voucher.update_purchase_invoice_allocated_costs",
+    },
 }
 
 # Scheduled Tasks
