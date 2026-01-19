@@ -10,10 +10,9 @@ frappe.provide("aljamil_customizations.landed_cost_voucher");
 frappe.ui.form.on("Landed Cost Voucher", {
     refresh: function(frm) {
         // Add button to create Purchase Invoices from supplier expenses
-        // Button is always visible when document is in draft status
         if (frm.doc.docstatus === 0) {
             frm.add_custom_button(
-                __("Create Purchase Invoices"),
+                __("Create Cost Invoice"),
                 function() {
                     aljamil_customizations.landed_cost_voucher.create_purchase_invoices(frm);
                 }
@@ -22,16 +21,32 @@ frappe.ui.form.on("Landed Cost Voucher", {
     },
 
     validate: function(frm) {
-        // Clear custom_expense_supplier if custom_expense_from_supplier is not checked
-        // This prevents mandatory field errors when checkbox is unchecked
+        // Clear fields to prevent mandatory field errors
         if (frm.doc.taxes) {
-            frm.doc.taxes.forEach(function(tax) {
-                if (!tax.custom_expense_from_supplier) {
-                    if (tax.custom_expense_supplier) {
+            let needs_refresh = false;
+            frm.doc.taxes.forEach(function(tax, index) {
+                // Convert checkbox to integer for comparison
+                let is_checked = cint(tax.custom_expense_from_supplier) === 1;
+                let has_supplier = tax.custom_expense_supplier;
+
+                // If checkbox is checked but supplier is empty, uncheck checkbox
+                if (is_checked && !has_supplier) {
+                    tax.custom_expense_from_supplier = 0;
+                    needs_refresh = true;
+                }
+                // If checkbox is unchecked, ensure supplier is cleared
+                if (!is_checked) {
+                    if (has_supplier) {
                         tax.custom_expense_supplier = null;
+                        needs_refresh = true;
                     }
                 }
             });
+
+            // Refresh taxes table if any changes were made
+            if (needs_refresh) {
+                frm.refresh_field("taxes");
+            }
         }
     }
 });
