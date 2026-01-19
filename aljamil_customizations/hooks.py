@@ -162,8 +162,13 @@ doc_events = {
         "before_save": "aljamil_customizations.sales_invoice.send_discount_approval_notifications",
     },
     "Landed Cost Voucher": {
+        "validate": "aljamil_customizations.landed_cost_voucher.validate_landed_cost_voucher_taxes",
         "on_submit": "aljamil_customizations.landed_cost_voucher.update_purchase_invoice_allocated_costs",
         "on_cancel": "aljamil_customizations.landed_cost_voucher.update_purchase_invoice_allocated_costs",
+    },
+    "Purchase Invoice": {
+        "on_submit": "aljamil_customizations.landed_cost_voucher.update_original_purchase_invoice_allocated_costs",
+        "on_cancel": "aljamil_customizations.landed_cost_voucher.update_original_purchase_invoice_allocated_costs_on_cancel",
     },
 }
 
