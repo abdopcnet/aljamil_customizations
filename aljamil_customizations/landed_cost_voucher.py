@@ -6,75 +6,6 @@ from erpnext.accounts.party import get_party_account
 from erpnext.setup.utils import get_exchange_rate
 
 
-# Override the original function by patching the module
-def _patch_get_item_account_wise_additional_cost():
-    """Patch the original function to exclude supplier expenses"""
-    from erpnext.stock.doctype.purchase_receipt import purchase_receipt
-    from erpnext.accounts.doctype.purchase_invoice import purchase_invoice
-
-    # Store original function
-    _original_function = purchase_receipt.get_item_account_wise_additional_cost
-
-    def patched_get_item_account_wise_additional_cost(purchase_document):
-        """Override to exclude expenses from supplier"""
-        # Call original function
-        result = _original_function(purchase_document)
-
-        if not result:
-            return result
-
-        # Get all Landed Cost Vouchers linked to this purchase document
-        landed_cost_vouchers = frappe.get_all(
-            "Landed Cost Purchase Receipt",
-            fields=["parent"],
-            filters={"receipt_document": purchase_document, "docstatus": 1},
-        )
-
-        if not landed_cost_vouchers:
-            return result
-
-        # Build a set of expense accounts that are from suppliers
-        supplier_expense_accounts = set()
-
-        for lcv in landed_cost_vouchers:
-            landed_cost_voucher_doc = frappe.get_doc("Landed Cost Voucher", lcv.parent)
-
-            # Get list of expense accounts that are from suppliers with Purchase Invoice
-            # Purchase Invoice will create GL entries, so we exclude from normal GL entries in PR
-            for tax in landed_cost_voucher_doc.taxes:
-                if (tax.get("custom_expense_from_supplier") and
-                    tax.expense_account and
-                        tax.get("custom_expense_purchase_invoice")):
-                    # Exclude if Purchase Invoice exists (Purchase Invoice handles GL entries instead of PR)
-                    supplier_expense_accounts.add(tax.expense_account)
-
-        # Remove these accounts from the result
-        if supplier_expense_accounts:
-            keys_to_remove = []
-            for key in list(result.keys()):
-                for expense_account in supplier_expense_accounts:
-                    if expense_account in result[key]:
-                        del result[key][expense_account]
-
-                # Mark for removal if item has no expense accounts left
-                if not result[key]:
-                    keys_to_remove.append(key)
-
-            # Remove empty entries
-            for key in keys_to_remove:
-                del result[key]
-
-        return result
-
-    # Patch both modules
-    purchase_receipt.get_item_account_wise_additional_cost = patched_get_item_account_wise_additional_cost
-    purchase_invoice.get_item_account_wise_additional_cost = patched_get_item_account_wise_additional_cost
-
-
-# Call the patch function when module is imported
-_patch_get_item_account_wise_additional_cost()
-
-
 # Journal Entry functions removed - Purchase Invoice handles GL entries now
 
 
@@ -254,4 +185,80 @@ def create_purchase_invoices_from_expenses(doc_name):
     return result
 
 
-# Journal Entry cancellation function removed - Purchase Invoice handles everything now
+def update_purchase_invoice_allocated_costs(doc, method):
+    """
+    Update custom_allocated_landed_cost table in Purchase Invoice
+    when Landed Cost Voucher is submitted or cancelled.
+
+    Mapping:
+    - Allocated Landed Cost.cost = Landed Cost Taxes and Charges.custom_service_item
+    - Allocated Landed Cost.total = Landed Cost Taxes and Charges.base_amount
+    Only for rows where custom_expense_from_supplier == 1
+    """
+    if not doc.get("purchase_receipts"):
+        return
+
+    # Get all Purchase Invoices linked to this LCV
+    purchase_invoices = set()
+
+    for pr_row in doc.get("purchase_receipts"):
+        if pr_row.receipt_document_type == "Purchase Invoice" and pr_row.receipt_document:
+            purchase_invoices.add(pr_row.receipt_document)
+
+    # Update each Purchase Invoice
+    for purchase_invoice_name in purchase_invoices:
+        try:
+            # Get all submitted LCVs linked to this Purchase Invoice
+            lcv_list = frappe.get_all(
+                "Landed Cost Purchase Receipt",
+                filters={
+                    "receipt_document_type": "Purchase Invoice",
+                    "receipt_document": purchase_invoice_name,
+                    "docstatus": 1
+                },
+                fields=["parent"],
+                distinct=True
+            )
+
+            # Aggregate costs from Landed Cost Taxes and Charges
+            # Key: custom_service_item, Value: sum of base_amount
+            service_item_costs = {}
+
+            for lcv_row in lcv_list:
+                lcv_doc = frappe.get_doc("Landed Cost Voucher", lcv_row.parent)
+
+                # Get taxes rows where custom_expense_from_supplier == 1
+                for tax_row in lcv_doc.get("taxes", []):
+                    if tax_row.get("custom_expense_from_supplier") and tax_row.get("custom_service_item"):
+                        service_item = tax_row.custom_service_item
+                        base_amount = flt(tax_row.get("base_amount") or 0)
+
+                        if service_item not in service_item_costs:
+                            service_item_costs[service_item] = 0.0
+                        service_item_costs[service_item] += base_amount
+
+            # Delete existing allocated costs
+            frappe.db.delete("Allocated Landed Cost", {
+                "parent": purchase_invoice_name
+            })
+
+            # Add new allocated costs using db_insert to avoid triggering GL entries recalculation
+            for service_item, total_amount in service_item_costs.items():
+                if total_amount > 0:
+                    allocated_cost = frappe.new_doc("Allocated Landed Cost")
+                    allocated_cost.parent = purchase_invoice_name
+                    allocated_cost.parenttype = "Purchase Invoice"
+                    allocated_cost.parentfield = "custom_allocated_landed_cost"
+                    allocated_cost.cost = service_item
+                    allocated_cost.total = total_amount
+                    allocated_cost.db_insert()
+
+            frappe.db.commit()
+
+        except Exception as e:
+            frappe.db.rollback()
+            frappe.log_error(
+                "[landed_cost_voucher.py] method: update_purchase_invoice_allocated_costs - "
+                "Purchase Invoice {0}: {1}".format(purchase_invoice_name, str(e)),
+                "Landed Cost Voucher Update Error"
+            )
