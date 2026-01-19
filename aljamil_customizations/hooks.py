@@ -51,11 +51,14 @@ doctype_js = {
     "Sales Invoice": [
         "public/js/sales_invoice.js",
     ],
-     "Purchase Order": [
+    "Purchase Order": [
         "public/js/purchase_order.js",
     ],
-     "Purchase Invoice": [
+    "Purchase Invoice": [
         "public/js/purchase_invoice.js",
+    ],
+    "Landed Cost Voucher": [
+        "public/js/landed_cost_voucher.js",
     ]
 }
 # doctype_list_js = {"doctype" : "public/js/doctype_list.js"}
@@ -158,10 +161,11 @@ doc_events = {
     "Sales Invoice": {
         "before_save": "aljamil_customizations.sales_invoice.send_discount_approval_notifications",
     },
-    "Landed Cost Voucher": {
-        "on_submit": "aljamil_customizations.landed_cost_voucher.create_expense_journal_entries",
-        "on_cancel": "aljamil_customizations.landed_cost_voucher.cancel_expense_journal_entries",
-    },
+    # Journal Entry logic removed - Purchase Invoice will create GL entries instead
+    # "Landed Cost Voucher": {
+    #     "on_submit": "aljamil_customizations.landed_cost_voucher.create_expense_journal_entries",
+    #     "on_cancel": "aljamil_customizations.landed_cost_voucher.cancel_expense_journal_entries",
+    # },
 }
 
 # Scheduled Tasks
@@ -192,10 +196,8 @@ doc_events = {
 
 # Overriding Methods
 # ------------------------------
-#
-# override_whitelisted_methods = {
-# 	"frappe.desk.doctype.event.event.get_events": "aljamil_customizations.event.get_events"
-# }
+# Note: get_item_account_wise_additional_cost is patched at module import level
+# No need for override_whitelisted_methods here
 #
 # each overriding function accepts a `data` argument;
 # generated from the base implementation of the doctype dashboard,
