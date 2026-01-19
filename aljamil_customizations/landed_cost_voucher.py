@@ -1,177 +1,257 @@
 import frappe
 from frappe import _
-from frappe.utils import flt
+from frappe.utils import flt, today, getdate
 import erpnext
 from erpnext.accounts.party import get_party_account
+from erpnext.setup.utils import get_exchange_rate
 
 
-def create_expense_journal_entries(doc, method):
-    """Create Journal Entries for expense rows with supplier when Landed Cost Voucher is submitted"""
+# Override the original function by patching the module
+def _patch_get_item_account_wise_additional_cost():
+    """Patch the original function to exclude supplier expenses"""
+    from erpnext.stock.doctype.purchase_receipt import purchase_receipt
+    from erpnext.accounts.doctype.purchase_invoice import purchase_invoice
 
-    if doc.doctype != "Landed Cost Voucher":
-        return
+    # Store original function
+    _original_function = purchase_receipt.get_item_account_wise_additional_cost
+
+    def patched_get_item_account_wise_additional_cost(purchase_document):
+        """Override to exclude expenses from supplier"""
+        # Call original function
+        result = _original_function(purchase_document)
+
+        if not result:
+            return result
+
+        # Get all Landed Cost Vouchers linked to this purchase document
+        landed_cost_vouchers = frappe.get_all(
+            "Landed Cost Purchase Receipt",
+            fields=["parent"],
+            filters={"receipt_document": purchase_document, "docstatus": 1},
+        )
+
+        if not landed_cost_vouchers:
+            return result
+
+        # Build a set of expense accounts that are from suppliers
+        supplier_expense_accounts = set()
+
+        for lcv in landed_cost_vouchers:
+            landed_cost_voucher_doc = frappe.get_doc("Landed Cost Voucher", lcv.parent)
+
+            # Get list of expense accounts that are from suppliers with Purchase Invoice
+            # Purchase Invoice will create GL entries, so we exclude from normal GL entries in PR
+            for tax in landed_cost_voucher_doc.taxes:
+                if (tax.get("custom_expense_from_supplier") and
+                    tax.expense_account and
+                        tax.get("custom_expense_purchase_invoice")):
+                    # Exclude if Purchase Invoice exists (Purchase Invoice handles GL entries instead of PR)
+                    supplier_expense_accounts.add(tax.expense_account)
+
+        # Remove these accounts from the result
+        if supplier_expense_accounts:
+            keys_to_remove = []
+            for key in list(result.keys()):
+                for expense_account in supplier_expense_accounts:
+                    if expense_account in result[key]:
+                        del result[key][expense_account]
+
+                # Mark for removal if item has no expense accounts left
+                if not result[key]:
+                    keys_to_remove.append(key)
+
+            # Remove empty entries
+            for key in keys_to_remove:
+                del result[key]
+
+        return result
+
+    # Patch both modules
+    purchase_receipt.get_item_account_wise_additional_cost = patched_get_item_account_wise_additional_cost
+    purchase_invoice.get_item_account_wise_additional_cost = patched_get_item_account_wise_additional_cost
+
+
+# Call the patch function when module is imported
+_patch_get_item_account_wise_additional_cost()
+
+
+# Journal Entry functions removed - Purchase Invoice handles GL entries now
+
+
+@frappe.whitelist()
+def create_purchase_invoices_from_expenses(doc_name):
+    """
+    Create Purchase Invoices for supplier expenses in Landed Cost Voucher.
+    Groups expenses by supplier and creates one Purchase Invoice per supplier.
+    """
+    doc = frappe.get_doc("Landed Cost Voucher", doc_name)
 
     if not doc.get("taxes"):
-        return
+        frappe.throw(_("No taxes and charges found in this document"))
+
+    # Group expenses by supplier and currency
+    # Key: (supplier, currency)
+    supplier_expenses = {}
 
     company_currency = erpnext.get_company_currency(doc.company)
 
     for tax_row in doc.get("taxes"):
-        # Check if custom fields are set
-        custom_expense_from_supplier = tax_row.get("custom_expense_from_supplier")
-        custom_expense_supplier = tax_row.get("custom_expense_supplier")
-
-        # Skip if conditions are not met
-        if not custom_expense_from_supplier or not custom_expense_supplier:
+        # Only process rows with custom_expense_from_supplier == 1
+        if not tax_row.get("custom_expense_from_supplier"):
             continue
 
-        # Validate expense account
-        if not tax_row.expense_account:
+        # Skip if Purchase Invoice already exists
+        if tax_row.get("custom_expense_purchase_invoice"):
+            continue
+
+        supplier = tax_row.get("custom_expense_supplier")
+        service_item = tax_row.get("custom_service_item")
+        amount = flt(tax_row.get("amount") or tax_row.get("base_amount"))
+
+        # Get currency from account_currency field, fallback to company currency
+        account_currency = tax_row.get("account_currency") or company_currency
+
+        if not supplier:
             frappe.throw(
-                _("Row {0}: Expense Account is required when 'Expense From Supplier' is checked").format(
+                _("Row {0}: Supplier is required when 'Expense From Supplier' is checked").format(
                     tax_row.idx
-                ),
-                title=_("Missing Expense Account")
-            )
-
-        # Get supplier account
-        try:
-            supplier_account = get_party_account("Supplier", custom_expense_supplier, doc.company)
-            if not supplier_account:
-                frappe.throw(
-                    _("Row {0}: Supplier Account not found for Supplier {1}").format(
-                        tax_row.idx, frappe.bold(custom_expense_supplier)
-                    ),
-                    title=_("Supplier Account Missing")
                 )
-        except Exception as e:
-            frappe.throw(
-                _("Row {0}: Error getting supplier account: {1}").format(tax_row.idx, str(e)),
-                title=_("Supplier Account Error")
             )
 
-        # Get account currencies
-        expense_account_currency = frappe.get_cached_value(
-            "Account", tax_row.expense_account, "account_currency") or company_currency
-        supplier_account_currency = frappe.get_cached_value(
-            "Account", supplier_account, "account_currency") or company_currency
+        if not service_item:
+            frappe.throw(
+                _("Row {0}: Service Item is required when 'Expense From Supplier' is checked").format(
+                    tax_row.idx
+                )
+            )
 
-        # Get amounts
-        base_amount = flt(tax_row.base_amount or tax_row.amount)
-        amount = flt(tax_row.amount)
-        exchange_rate = flt(tax_row.exchange_rate or 1)
-
-        if not base_amount:
+        if not amount:
             continue
 
-        # Calculate amounts in account currency
-        expense_debit_in_account_currency = amount if expense_account_currency != company_currency else base_amount
-        supplier_credit_in_account_currency = amount if supplier_account_currency != company_currency else base_amount
+        # Group by (supplier, currency) tuple
+        key = (supplier, account_currency)
+        if key not in supplier_expenses:
+            supplier_expenses[key] = []
 
-        # Create Journal Entry
-        journal_entry = frappe.new_doc("Journal Entry")
-        journal_entry.posting_date = doc.posting_date
-        journal_entry.company = doc.company
-        journal_entry.voucher_type = "Journal Entry"
-
-        # Get receipt document numbers from purchase_receipts table
-        receipt_documents = []
-        if doc.get("purchase_receipts"):
-            for pr in doc.get("purchase_receipts"):
-                if pr.receipt_document:
-                    receipt_documents.append(pr.receipt_document)
-
-        # Set remark in Arabic with receipt document numbers
-        description_text = tax_row.description or ""
-        if receipt_documents:
-            receipt_docs_str = ", ".join(receipt_documents)
-            journal_entry.user_remark = "قيد رسوم ضرائب فاتورة مشتريات - {0} - {1}".format(
-                receipt_docs_str, description_text
-            )
-        else:
-            journal_entry.user_remark = "قيد رسوم ضرائب فاتورة مشتريات - {0}".format(
-                description_text
-            )
-
-        # Debit: Expense Account
-        journal_entry.append("accounts", {
-            "account": tax_row.expense_account,
-            "debit_in_account_currency": expense_debit_in_account_currency,
-            "debit": base_amount,
-            "account_currency": expense_account_currency,
-            "exchange_rate": exchange_rate if expense_account_currency != company_currency else 1,
-            "party_type": None,
-            "party": None,
+        supplier_expenses[key].append({
+            "tax_row": tax_row,
+            "service_item": service_item,
+            "amount": amount,
+            "base_amount": flt(tax_row.get("base_amount") or amount),
+            "description": tax_row.get("description") or "",
+            "row_idx": tax_row.idx,
+            "account_currency": account_currency
         })
 
-        # Credit: Supplier Account
-        journal_entry.append("accounts", {
-            "account": supplier_account,
-            "credit_in_account_currency": supplier_credit_in_account_currency,
-            "credit": base_amount,
-            "account_currency": supplier_account_currency,
-            "exchange_rate": exchange_rate if supplier_account_currency != company_currency else 1,
-            "party_type": "Supplier",
-            "party": custom_expense_supplier,
-        })
+    if not supplier_expenses:
+        frappe.throw(_("No supplier expenses found. Please check 'Expense From Supplier' and fill required fields."))
 
-        # Save and submit Journal Entry
+    created_invoices = []
+    errors = []
+
+    for key, expenses in supplier_expenses.items():
+        supplier, currency = key
+
         try:
-            journal_entry.insert(ignore_permissions=True)
-            journal_entry.submit()
+            # Get supplier account
+            supplier_account = get_party_account("Supplier", supplier, doc.company)
+            if not supplier_account:
+                errors.append({
+                    "supplier": supplier,
+                    "error": _("Supplier Account not found")
+                })
+                continue
 
-            # Update custom_expense_journal_entry field in tax_row
-            frappe.db.set_value(
-                "Landed Cost Taxes and Charges",
-                tax_row.name,
-                "custom_expense_journal_entry",
-                journal_entry.name
-            )
+            # Get exchange rate if currency is different from company currency
+            if currency != company_currency:
+                exchange_rate = get_exchange_rate(
+                    from_currency=currency,
+                    to_currency=company_currency,
+                    transaction_date=doc.posting_date or today(),
+                    args="for_buying"
+                ) or 1.0
+            else:
+                exchange_rate = 1.0
+
+            # Create Purchase Invoice
+            purchase_invoice = frappe.new_doc("Purchase Invoice")
+            purchase_invoice.company = doc.company
+            purchase_invoice.supplier = supplier
+            purchase_invoice.posting_date = doc.posting_date or today()
+            purchase_invoice.currency = currency
+            purchase_invoice.conversion_rate = exchange_rate
+            purchase_invoice.bill_no = f"LCV-{doc.name}"
+            purchase_invoice.bill_date = doc.posting_date or today()
+
+            # Add items - simple: just use custom_service_item and amount
+            total_amount = 0
+            for exp in expenses:
+                # Add item to Purchase Invoice
+                # Only use: item_code (custom_service_item), rate (amount), description
+                # Let set_missing_values() handle all other required fields automatically
+                purchase_invoice.append("items", {
+                    "item_code": exp["service_item"],
+                    "qty": 1.0,
+                    "rate": exp["amount"],
+                    "description": exp["description"] or ""
+                })
+
+                total_amount += exp["base_amount"]
+
+            # Set missing values
+            purchase_invoice.set_missing_values()
+
+            # Save Purchase Invoice (as draft)
+            purchase_invoice.insert(ignore_permissions=True)
+            purchase_invoice.save(ignore_permissions=True)
+
+            # Update custom_expense_purchase_invoice in all related tax rows
+            for exp in expenses:
+                frappe.db.set_value(
+                    "Landed Cost Taxes and Charges",
+                    exp["tax_row"].name,
+                    "custom_expense_purchase_invoice",
+                    purchase_invoice.name
+                )
+
             frappe.db.commit()
 
+            created_invoices.append({
+                "supplier": supplier,
+                "currency": currency,
+                "invoice": purchase_invoice.name,
+                "items_count": len(expenses),
+                "total_amount": total_amount
+            })
+
         except Exception as e:
             frappe.db.rollback()
+            error_msg = str(e)
+            errors.append({
+                "supplier": supplier,
+                "error": error_msg
+            })
             frappe.log_error(
-                "[landed_cost_voucher.py] method: create_expense_journal_entries",
-                "Landed Cost Voucher Journal Entry Error"
+                "[landed_cost_voucher.py] method: create_purchase_invoices_from_expenses - Supplier {0}: {1}".format(
+                    supplier, error_msg
+                ),
+                "Landed Cost Voucher Purchase Invoice Creation Error"
             )
-            frappe.throw(
-                _("Row {0}: Error creating Journal Entry: {1}").format(tax_row.idx, str(e)),
-                title=_("Journal Entry Creation Error")
-            )
-
-
-def cancel_expense_journal_entries(doc, method):
-    """Cancel all Journal Entries created for expense rows when Landed Cost Voucher is cancelled"""
-
-    if doc.doctype != "Landed Cost Voucher":
-        return
-
-    if not doc.get("taxes"):
-        return
-
-    for tax_row in doc.get("taxes"):
-        # Get Journal Entry name from custom field
-        journal_entry_name = tax_row.get("custom_expense_journal_entry")
-
-        if not journal_entry_name:
             continue
 
-        # Check if Journal Entry exists and is submitted
-        try:
-            je_docstatus = frappe.db.get_value("Journal Entry", journal_entry_name, "docstatus")
-            if je_docstatus == 1:  # Only cancel if submitted
-                journal_entry = frappe.get_doc("Journal Entry", journal_entry_name)
-                journal_entry.cancel()
-                frappe.db.commit()
-        except frappe.DoesNotExistError:
-            # Journal Entry doesn't exist, skip
-            continue
-        except Exception as e:
-            frappe.db.rollback()
-            frappe.log_error(
-                "[landed_cost_voucher.py] method: cancel_expense_journal_entries",
-                "Landed Cost Voucher Journal Entry Cancel Error"
-            )
-            # Continue with other Journal Entries even if one fails
-            continue
+    # Return result
+    result = {
+        "created_invoices": created_invoices,
+        "errors": errors
+    }
+
+    if errors:
+        error_msg = _("Some Purchase Invoices could not be created:\n")
+        for err in errors:
+            error_msg += _("Supplier {0}: {1}\n").format(err["supplier"], err["error"])
+        frappe.msgprint(error_msg, alert=True, indicator="orange")
+
+    return result
+
+
+# Journal Entry cancellation function removed - Purchase Invoice handles everything now
