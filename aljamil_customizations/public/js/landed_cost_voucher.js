@@ -21,16 +21,17 @@ frappe.ui.form.on("Landed Cost Voucher", {
         }
     },
 
-});
-
-// Handle custom fields in taxes table
-frappe.ui.form.on("Landed Cost Taxes and Charges", {
-    custom_expense_from_supplier: function(frm, cdt, cdn) {
-        var row = locals[cdt][cdn];
-        if (!row.custom_expense_from_supplier) {
-            // Clear supplier-related fields if checkbox is unchecked
-            frappe.model.set_value(cdt, cdn, "custom_expense_supplier", null);
-            frappe.model.set_value(cdt, cdn, "custom_service_item", null);
+    validate: function(frm) {
+        // Clear custom_expense_supplier if custom_expense_from_supplier is not checked
+        // This prevents mandatory field errors when checkbox is unchecked
+        if (frm.doc.taxes) {
+            frm.doc.taxes.forEach(function(tax) {
+                if (!tax.custom_expense_from_supplier) {
+                    if (tax.custom_expense_supplier) {
+                        tax.custom_expense_supplier = null;
+                    }
+                }
+            });
         }
     }
 });
@@ -114,12 +115,12 @@ aljamil_customizations.landed_cost_voucher.create_purchase_invoices = function(f
                         if (r.message.created_invoices && r.message.created_invoices.length > 0) {
                             msg += "<div style='margin-top: 10px;'>";
                             msg += "<h4 style='color: green; margin-bottom: 10px;'>" + __("Created Purchase Invoices:") + "</h4>";
-                            msg += "<table class='table table-bordered' style='margin-bottom: 0;'>";
+                            msg += "<table class='table table-bordered' style='margin-bottom: 0; table-layout: auto; width: 100%;'>";
                             msg += "<thead><tr>";
-                            msg += "<th style='width: 30%;'>" + __("Invoice") + "</th>";
-                            msg += "<th style='width: 25%;'>" + __("Supplier") + "</th>";
-                            msg += "<th style='width: 15%; text-align: center;'>" + __("Items") + "</th>";
-                            msg += "<th style='width: 30%; text-align: right;'>" + __("Amount") + "</th>";
+                            msg += "<th style='white-space: nowrap; padding: 8px;'>" + __("Invoice") + "</th>";
+                            msg += "<th style='white-space: nowrap; padding: 8px;'>" + __("Supplier") + "</th>";
+                            msg += "<th style='white-space: nowrap; padding: 8px; text-align: center;'>" + __("Items") + "</th>";
+                            msg += "<th style='white-space: nowrap; padding: 8px; text-align: right;'>" + __("Amount") + "</th>";
                             msg += "</tr></thead>";
                             msg += "<tbody>";
                             r.message.created_invoices.forEach(function(inv) {
@@ -144,10 +145,10 @@ aljamil_customizations.landed_cost_voucher.create_purchase_invoices = function(f
                                     inv.invoice
                                 );
                                 msg += "<tr>";
-                                msg += "<td>" + invoice_link + "</td>";
-                                msg += "<td>" + inv.supplier + "</td>";
-                                msg += "<td style='text-align: center;'>" + inv.items_count + "</td>";
-                                msg += "<td style='text-align: right;'>" + formatted_amount + "</td>";
+                                msg += "<td style='white-space: nowrap; padding: 8px;'>" + invoice_link + "</td>";
+                                msg += "<td style='white-space: nowrap; padding: 8px;'>" + inv.supplier + "</td>";
+                                msg += "<td style='white-space: nowrap; padding: 8px; text-align: center;'>" + inv.items_count + "</td>";
+                                msg += "<td style='white-space: nowrap; padding: 8px; text-align: right;'>" + formatted_amount + "</td>";
                                 msg += "</tr>";
                             });
                             msg += "</tbody></table>";
@@ -157,16 +158,16 @@ aljamil_customizations.landed_cost_voucher.create_purchase_invoices = function(f
                         if (r.message.errors && r.message.errors.length > 0) {
                             msg += "<div style='margin-top: 15px;'>";
                             msg += "<h4 style='color: red; margin-bottom: 10px;'>" + __("Errors:") + "</h4>";
-                            msg += "<table class='table table-bordered' style='margin-bottom: 0;'>";
+                            msg += "<table class='table table-bordered' style='margin-bottom: 0; table-layout: auto; width: 100%;'>";
                             msg += "<thead><tr>";
-                            msg += "<th style='width: 30%;'>" + __("Supplier") + "</th>";
-                            msg += "<th style='width: 70%;'>" + __("Error") + "</th>";
+                            msg += "<th style='white-space: nowrap; padding: 8px;'>" + __("Supplier") + "</th>";
+                            msg += "<th style='white-space: nowrap; padding: 8px;'>" + __("Error") + "</th>";
                             msg += "</tr></thead>";
                             msg += "<tbody>";
                             r.message.errors.forEach(function(err) {
                                 msg += "<tr>";
-                                msg += "<td>" + err.supplier + "</td>";
-                                msg += "<td style='color: red;'>" + err.error + "</td>";
+                                msg += "<td style='white-space: nowrap; padding: 8px;'>" + err.supplier + "</td>";
+                                msg += "<td style='white-space: nowrap; padding: 8px; color: red;'>" + err.error + "</td>";
                                 msg += "</tr>";
                             });
                             msg += "</tbody></table>";
