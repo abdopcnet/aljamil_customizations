@@ -167,8 +167,9 @@ doc_events = {
         "on_cancel": "aljamil_customizations.landed_cost_voucher.update_purchase_invoice_allocated_costs",
     },
     "Purchase Invoice": {
-        "on_submit": "aljamil_customizations.landed_cost_voucher.update_original_purchase_invoice_allocated_costs",
-        "on_cancel": "aljamil_customizations.landed_cost_voucher.update_original_purchase_invoice_allocated_costs_on_cancel",
+        "validate": "aljamil_customizations.purchase_invoice.update_allocated_costs_totals",
+        "on_submit": "aljamil_customizations.purchase_invoice.update_original_purchase_invoice_allocated_costs",
+        "on_cancel": "aljamil_customizations.purchase_invoice.update_original_purchase_invoice_allocated_costs_on_cancel",
     },
 }
 
