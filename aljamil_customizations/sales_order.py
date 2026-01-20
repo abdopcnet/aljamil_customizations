@@ -78,12 +78,5 @@ def _send_notifications_for_item(doc, item, valid_users):
                             "for_user": user,
                         }
                     ).insert(ignore_permissions=True)
-                    frappe.log_error(
-                        "[sales_order.py] method: send_discount_approval_notifications",
-                        "Discount Approval Notification",
-                    )
                 except Exception as e:
-                    frappe.log_error(
-                        f"[sales_order.py] method: send_discount_approval_notifications - Error: {str(e)}",
-                        "Discount Approval Notification Error",
-                    )
+                    frappe.log_error(f"[sales_order.py] send_discount_approval_notifications")
