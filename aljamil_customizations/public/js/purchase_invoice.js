@@ -2,6 +2,38 @@
 // Multi Add for Purchase Invoice (native items table)
 frappe.ui.form.on('Purchase Invoice', {
 	refresh(frm) {
+		// Refresh allocated costs totals if document is not new
+		// Fetch and update silently if values are not calculated
+		if (frm.doc && frm.doc.name && !frm.is_new()) {
+			frappe.call({
+				method: 'aljamil_customizations.purchase_invoice.refresh_allocated_costs_totals',
+				args: {
+					purchase_invoice_name: frm.doc.name
+				},
+				freeze: false,
+				callback: function(r) {
+					if (r.message) {
+						// Update fields silently with calculated values
+						var calculated_total = flt(r.message.total_cost || 0);
+						var calculated_vat = flt(r.message.total_vat || 0);
+						var current_total = flt(frm.doc.custom_total_cost || 0);
+						var current_vat = flt(frm.doc.custom_vat_on_costs || 0);
+
+						// Always update if calculated values exist and are different
+						if (calculated_total !== current_total || calculated_vat !== current_vat) {
+							frm.set_value('custom_total_cost', calculated_total);
+							frm.set_value('custom_vat_on_costs', calculated_vat);
+							frm.refresh_field('custom_total_cost');
+							frm.refresh_field('custom_vat_on_costs');
+						}
+					}
+				},
+				error: function(r) {
+					// Silent fail - don't show error to user
+				}
+			});
+		}
+
 		if (!frm.fields_dict.items) return;
 		const grid = frm.fields_dict.items.grid;
 		if (!grid) return;
