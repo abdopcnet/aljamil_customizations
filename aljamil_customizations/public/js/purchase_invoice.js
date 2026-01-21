@@ -1,38 +1,77 @@
 (function () {
 // Multi Add for Purchase Invoice (native items table)
 frappe.ui.form.on('Purchase Invoice', {
-	refresh(frm) {
-		// Refresh allocated costs totals if document is not new
-		// Fetch and update silently if values are not calculated
+	onload(frm) {
+		// Refresh allocated costs when document is first loaded
+		// Recalculates from LCVs and Cost Purchase Invoices
 		if (frm.doc && frm.doc.name && !frm.is_new()) {
+			// Use session storage to prevent multiple calls across reloads
+			var storage_key = 'pi_refresh_' + frm.doc.name;
+			var last_refresh = sessionStorage.getItem(storage_key);
+			var now = Date.now();
+			
+			// Only refresh if not called in last 2 seconds (prevents reload loops)
+			if (last_refresh && (now - parseInt(last_refresh)) < 2000) {
+				return;
+			}
+			sessionStorage.setItem(storage_key, now.toString());
+
+			// Set flag to prevent multiple simultaneous calls
+			if (frm._refreshing_allocated_costs) {
+				return;
+			}
+			frm._refreshing_allocated_costs = true;
+
 			frappe.call({
-				method: 'aljamil_customizations.purchase_invoice.refresh_allocated_costs_totals',
+				method: 'aljamil_customizations.purchase_invoice.refresh_allocated_costs_on_open',
 				args: {
 					purchase_invoice_name: frm.doc.name
 				},
 				freeze: false,
 				callback: function(r) {
-					if (r.message) {
-						// Update fields silently with calculated values
-						var calculated_total = flt(r.message.total_cost || 0);
-						var calculated_vat = flt(r.message.total_vat || 0);
-						var current_total = flt(frm.doc.custom_total_cost || 0);
-						var current_vat = flt(frm.doc.custom_vat_on_costs || 0);
+					frm._refreshing_allocated_costs = false;
+					if (r.message && r.message.updated) {
+						// Reload document to show updated values
+						// The session storage will prevent this from looping
+						frm.reload_doc();
+					} else {
+						// Just update totals if no recalculation needed
+						frappe.call({
+							method: 'aljamil_customizations.purchase_invoice.refresh_allocated_costs_totals',
+							args: {
+								purchase_invoice_name: frm.doc.name
+							},
+							freeze: false,
+							callback: function(r2) {
+								if (r2.message) {
+									var calculated_total = flt(r2.message.total_cost || 0);
+									var calculated_vat = flt(r2.message.total_vat || 0);
+									var current_total = flt(frm.doc.custom_total_cost || 0);
+									var current_vat = flt(frm.doc.custom_vat_on_costs || 0);
 
-						// Always update if calculated values exist and are different
-						if (calculated_total !== current_total || calculated_vat !== current_vat) {
-							frm.set_value('custom_total_cost', calculated_total);
-							frm.set_value('custom_vat_on_costs', calculated_vat);
-							frm.refresh_field('custom_total_cost');
-							frm.refresh_field('custom_vat_on_costs');
-						}
+									if (calculated_total !== current_total || calculated_vat !== current_vat) {
+										frm.set_value('custom_total_cost', calculated_total);
+										frm.set_value('custom_vat_on_costs', calculated_vat);
+										frm.refresh_field('custom_total_cost');
+										frm.refresh_field('custom_vat_on_costs');
+									}
+								}
+							},
+							error: function(r) {
+								// Silent fail
+							}
+						});
 					}
 				},
 				error: function(r) {
+					frm._refreshing_allocated_costs = false;
 					// Silent fail - don't show error to user
 				}
 			});
 		}
+	},
+
+	refresh(frm) {
 
 		if (!frm.fields_dict.items) return;
 		const grid = frm.fields_dict.items.grid;
