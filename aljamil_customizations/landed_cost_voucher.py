@@ -218,153 +218,178 @@ def create_purchase_invoices_from_expenses(doc_name):
             continue
 
     # Return result
-    result = {
+    return {
         "created_invoices": created_invoices,
         "errors": errors
     }
 
-    if errors:
-        error_msg = _("Some Purchase Invoices could not be created:\n")
-        for err in errors:
-            error_msg += _("Supplier {0}: {1}\n").format(err["supplier"], err["error"])
-        frappe.msgprint(error_msg, alert=True, indicator="orange")
 
-    return result
-
-
-def update_purchase_invoice_allocated_costs(doc, method):
+def update_original_purchase_invoice_allocated_costs_on_submit_landed_cost_voucher(doc, method):
     """
-    Update custom_allocated_landed_cost table in Purchase Invoice
-    when Landed Cost Voucher is submitted or cancelled.
+    Update custom_allocated_landed_cost table in original Purchase Invoice
+    when Landed Cost Voucher is submitted.
 
-    Mapping:
-    - Allocated Landed Cost.cost = Landed Cost Taxes and Charges.custom_service_item
-    - Allocated Landed Cost.total = Landed Cost Taxes and Charges.base_amount
-    Includes all rows with custom_service_item (regardless of custom_expense_from_supplier)
+    Logic:
+    - Must have exactly one row in purchase_receipts (tabLanded Cost Purchase Receipt)
+    - receipt_document_type = Purchase Invoice
+    - From taxes (tabLanded Cost Taxes and Charges): custom_service_item where custom_expense_from_supplier != 1
+    - Record: custom_service_item = custom_service_item, item_base_amount = base_amount, item_base_tax_amount = 0
     """
     if not doc.get("purchase_receipts"):
         return
 
-    # Get all Purchase Invoices linked to this LCV
-    purchase_invoices = set()
-
+    # Get Purchase Invoice from purchase_receipts - must have exactly one row
+    purchase_invoice_name = None
+    purchase_invoice_count = 0
+    
     for pr_row in doc.get("purchase_receipts"):
         if pr_row.receipt_document_type == "Purchase Invoice" and pr_row.receipt_document:
-            purchase_invoices.add(pr_row.receipt_document)
+            purchase_invoice_name = pr_row.receipt_document
+            purchase_invoice_count += 1
 
-    # Update each Purchase Invoice
-    for purchase_invoice_name in purchase_invoices:
-        try:
-            # Delete only rows created by this LCV (not rows from Purchase Invoices or other LCVs)
-            # This allows multiple LCVs and Purchase Invoices to coexist
-            rows_to_delete = frappe.get_all(
-                "Allocated Landed Cost",
-                filters={
-                    "parent": purchase_invoice_name,
-                    "parenttype": "Purchase Invoice",
-                    "parentfield": "custom_allocated_landed_cost",
-                    "source_document_type": doc.doctype,
-                    "source_document": doc.name
-                },
-                fields=["name"]
-            )
+    # Must have exactly one Purchase Invoice
+    if purchase_invoice_count == 0:
+        return
+    
+    if purchase_invoice_count > 1:
+        frappe.log_error(f"[landed_cost_voucher.py] update_original_purchase_invoice_allocated_costs_on_submit_landed_cost_voucher")
+        return
 
-            for row in rows_to_delete:
-                frappe.db.delete("Allocated Landed Cost", row.name)
+    # Get taxes with custom_service_item where custom_expense_from_supplier != 1
+    taxes_data = frappe.db.sql("""
+        SELECT name, base_amount, custom_service_item
+        FROM `tabLanded Cost Taxes and Charges`
+        WHERE parent = %s
+        AND custom_service_item IS NOT NULL
+        AND custom_service_item != ''
+        AND (custom_expense_from_supplier IS NULL OR custom_expense_from_supplier = 0)
+        AND base_amount > 0
+    """, (doc.name,), as_dict=True)
 
-            # Get taxes rows from this LCV only (not all LCVs)
-            # Get taxes rows where custom_service_item is set AND custom_expense_from_supplier != 1
-            # Only include rows where custom_expense_from_supplier is not checked (0 or null)
-            for tax_row in doc.get("taxes", []):
-                # Skip rows where custom_expense_from_supplier == 1
-                if cint(tax_row.get("custom_expense_from_supplier")) == 1:
-                    continue
+    if not taxes_data:
+        return
 
-                # Only process rows with custom_service_item and custom_expense_from_supplier != 1
-                if tax_row.get("custom_service_item"):
-                    service_item = tax_row.custom_service_item
-                    base_amount = flt(tax_row.get("base_amount") or 0)
+    try:
+        # Delete only rows created by this LCV
+        frappe.db.sql("""
+            DELETE FROM `tabAllocated Landed Cost`
+            WHERE parent = %s
+            AND parenttype = 'Purchase Invoice'
+            AND parentfield = 'custom_allocated_landed_cost'
+            AND source_document_type = %s
+            AND source_document = %s
+        """, (purchase_invoice_name, doc.doctype, doc.name))
 
-                    if base_amount > 0:
-                        # Add new row for this LCV
-                        allocated_cost = frappe.new_doc("Allocated Landed Cost")
-                        allocated_cost.parent = purchase_invoice_name
-                        allocated_cost.parenttype = "Purchase Invoice"
-                        allocated_cost.parentfield = "custom_allocated_landed_cost"
-                        allocated_cost.cost = service_item
-                        allocated_cost.total = base_amount
-                        allocated_cost.vat = 0.0  # LCV doesn't have VAT calculation
-                        allocated_cost.source_document_type = doc.doctype
-                        allocated_cost.source_document = doc.name
-                        allocated_cost.db_insert()
+        # Add new rows for each tax - use base_amount directly
+        for tax in taxes_data:
+            allocated_cost = frappe.new_doc("Allocated Landed Cost")
+            allocated_cost.parent = purchase_invoice_name
+            allocated_cost.parenttype = "Purchase Invoice"
+            allocated_cost.parentfield = "custom_allocated_landed_cost"
+            allocated_cost.custom_service_item = tax.custom_service_item
+            allocated_cost.item_base_amount = flt(tax.base_amount, precision=2)
+            allocated_cost.item_base_tax_amount = 0.0
+            allocated_cost.source_document_type = doc.doctype
+            allocated_cost.source_document = doc.name
+            allocated_cost.db_insert()
 
-            frappe.db.commit()
+        frappe.db.commit()
 
-            # Update totals in Purchase Invoice
-            update_allocated_costs_totals(purchase_invoice_name)
+        # Update totals in Purchase Invoice
+        update_allocated_costs_totals(purchase_invoice_name)
 
-        except Exception as e:
-            frappe.log_error(f"[landed_cost_voucher.py] update_purchase_invoice_allocated_costs")
+    except Exception as e:
+        frappe.log_error(f"[landed_cost_voucher.py] update_original_purchase_invoice_allocated_costs_on_submit_landed_cost_voucher")
+
+
+def update_original_purchase_invoice_allocated_costs_on_cancel_landed_cost_voucher(doc, method):
+    """
+    Update custom_allocated_landed_cost table in original Purchase Invoice
+    when Landed Cost Voucher is cancelled.
+
+    Simple: Delete rows created by this LCV.
+    Based on: tabLanded Cost Taxes and Charges.base_amount
+    """
+    if not doc.get("purchase_receipts"):
+        return
+
+    # Get Purchase Invoice from purchase_receipts
+    purchase_invoice_name = None
+    for pr_row in doc.get("purchase_receipts"):
+        if pr_row.receipt_document_type == "Purchase Invoice" and pr_row.receipt_document:
+            purchase_invoice_name = pr_row.receipt_document
+            break
+
+    if not purchase_invoice_name:
+        return
+
+    try:
+        # Delete rows created by this LCV
+        frappe.db.sql("""
+            DELETE FROM `tabAllocated Landed Cost`
+            WHERE parent = %s
+            AND parenttype = 'Purchase Invoice'
+            AND parentfield = 'custom_allocated_landed_cost'
+            AND source_document_type = %s
+            AND source_document = %s
+        """, (purchase_invoice_name, doc.doctype, doc.name))
+
+        frappe.db.commit()
+
+        # Update totals in Purchase Invoice
+        update_allocated_costs_totals(purchase_invoice_name)
+
+    except Exception as e:
+        frappe.log_error(f"[landed_cost_voucher.py] update_original_purchase_invoice_allocated_costs_on_cancel_landed_cost_voucher")
 
 
 @frappe.whitelist()
-def fix_old_allocated_costs_for_invoice(purchase_invoice_name):
+def recalculate_allocated_costs_for_invoice(purchase_invoice_name):
     """
-    Fix old Allocated Landed Cost rows for a specific Purchase Invoice.
-    Updates rows that don't have source_document_type and source_document.
-
-    Usage: bench --site all execute aljamil_customizations.landed_cost_voucher.fix_old_allocated_costs_for_invoice --kwargs '{"purchase_invoice_name": "ACC-PINV-2026-00037"}'
+    Recalculate Allocated Landed Cost rows for a specific Purchase Invoice
+    from all linked Landed Cost Vouchers.
+    
+    Usage: bench --site all execute aljamil_customizations.landed_cost_voucher.recalculate_allocated_costs_for_invoice --kwargs '{"purchase_invoice_name": "ACC-PINV-2026-00050"}'
     """
     if not frappe.db.exists("Purchase Invoice", purchase_invoice_name):
-        frappe.throw(f"Purchase Invoice {purchase_invoice_name} not found")
-
-    pi = frappe.get_doc("Purchase Invoice", purchase_invoice_name)
-    original_pi_name = pi.get("custom_original_purchase_invoice")
-
-    if not original_pi_name:
-        frappe.throw(f"Purchase Invoice {purchase_invoice_name} does not have custom_original_purchase_invoice")
-
-    # Get items from this Purchase Invoice
-    items_list = []
-    for item in pi.get("items", []):
-        if item.item_code:
-            items_list.append(item.item_code)
-
-    if not items_list:
-        frappe.msgprint(f"No items found in {purchase_invoice_name}.")
+        frappe.log_error(f"[landed_cost_voucher.py] recalculate_allocated_costs_for_invoice")
         return
-
-    # Find rows in original PI that match these items but don't have source_document
-    rows_to_fix = frappe.get_all(
-        "Allocated Landed Cost",
-        filters={
-            "parent": original_pi_name,
-            "parenttype": "Purchase Invoice",
-            "parentfield": "custom_allocated_landed_cost",
-            "source_document_type": ["is", "not set"],
-            "source_document": ["is", "not set"],
-            "cost": ["in", items_list]
-        },
-        fields=["name", "cost", "total", "vat"]
-    )
-
-    if not rows_to_fix:
-        frappe.msgprint(f"No rows to fix for {purchase_invoice_name}.")
+    
+    # Get all LCVs linked to this Purchase Invoice
+    lcv_list = frappe.db.sql("""
+        SELECT DISTINCT parent as lcv_name
+        FROM `tabLanded Cost Purchase Receipt`
+        WHERE receipt_document = %s
+        AND receipt_document_type = 'Purchase Invoice'
+    """, (purchase_invoice_name,), as_dict=True)
+    
+    if not lcv_list:
         return
-
-    # Update rows
-    updated_count = 0
-    for row in rows_to_fix:
-        frappe.db.set_value(
-            "Allocated Landed Cost",
-            row.name,
-            {
-                "source_document_type": "Purchase Invoice",
-                "source_document": purchase_invoice_name
-            }
-        )
-        updated_count += 1
-
-    frappe.db.commit()
-    frappe.msgprint(f"Fixed {updated_count} rows for {purchase_invoice_name}.")
-    return updated_count
+    
+    # Recalculate for each LCV
+    for lcv_row in lcv_list:
+        lcv_name = lcv_row.lcv_name
+        try:
+            lcv_doc = frappe.get_doc("Landed Cost Voucher", lcv_name)
+            update_original_purchase_invoice_allocated_costs_on_submit_landed_cost_voucher(lcv_doc, None)
+        except Exception as e:
+            frappe.log_error(f"[landed_cost_voucher.py] recalculate_allocated_costs_for_invoice")
+    
+    # Also recalculate from cost Purchase Invoices
+    cost_invoices = frappe.db.sql("""
+        SELECT name
+        FROM `tabPurchase Invoice`
+        WHERE custom_original_purchase_invoice = %s
+        AND docstatus = 1
+    """, (purchase_invoice_name,), as_dict=True)
+    
+    for cost_inv in cost_invoices:
+        try:
+            # Import here to avoid circular import
+            from aljamil_customizations.purchase_invoice import (
+                update_original_purchase_invoice_allocated_costs_on_submit_cost_purchase_invoice
+            )
+            cost_pi = frappe.get_doc("Purchase Invoice", cost_inv.name)
+            update_original_purchase_invoice_allocated_costs_on_submit_cost_purchase_invoice(cost_pi, None)
+        except Exception as e:
+            frappe.log_error(f"[landed_cost_voucher.py] recalculate_allocated_costs_for_invoice")
