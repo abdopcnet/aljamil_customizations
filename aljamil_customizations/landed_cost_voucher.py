@@ -257,7 +257,7 @@ def update_original_purchase_invoice_allocated_costs_on_submit_landed_cost_vouch
 
     # Get taxes with custom_service_item where custom_expense_from_supplier != 1
     taxes_data = frappe.db.sql("""
-        SELECT name, base_amount, custom_service_item
+        SELECT name, amount, base_amount, custom_service_item
         FROM `tabLanded Cost Taxes and Charges`
         WHERE parent = %s
         AND custom_service_item IS NOT NULL
@@ -287,7 +287,8 @@ def update_original_purchase_invoice_allocated_costs_on_submit_landed_cost_vouch
             allocated_cost.parenttype = "Purchase Invoice"
             allocated_cost.parentfield = "custom_allocated_landed_cost"
             allocated_cost.custom_service_item = tax.custom_service_item
-            allocated_cost.item_base_amount = flt(tax.base_amount, precision=2)
+            allocated_cost.item_amount = tax.amount
+            allocated_cost.item_base_amount = tax.base_amount
             allocated_cost.item_base_tax_amount = 0.0
             allocated_cost.source_document_type = doc.doctype
             allocated_cost.source_document = doc.name
