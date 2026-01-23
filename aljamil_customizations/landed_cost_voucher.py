@@ -1,6 +1,6 @@
 import frappe
 from frappe import _
-from frappe.utils import flt, today, getdate, cint
+from frappe.utils import flt, today, getdate, cint, add_days
 import erpnext
 import json
 from erpnext.accounts.party import get_party_account
@@ -129,12 +129,15 @@ def create_purchase_invoices_from_expenses(doc_name):
                 })
                 continue
 
+            # Get posting_date from LCV, use today() as fallback only for exchange rate calculation
+            posting_date = doc.posting_date or today()
+            
             # Get exchange rate if currency is different from company currency
             if currency != company_currency:
                 exchange_rate = get_exchange_rate(
                     from_currency=currency,
                     to_currency=company_currency,
-                    transaction_date=doc.posting_date or today(),
+                    transaction_date=posting_date,
                     args="for_buying"
                 ) or 1.0
             else:
@@ -153,7 +156,11 @@ def create_purchase_invoices_from_expenses(doc_name):
             purchase_invoice = frappe.new_doc("Purchase Invoice")
             purchase_invoice.company = doc.company
             purchase_invoice.supplier = supplier
-            purchase_invoice.posting_date = doc.posting_date or today()
+            purchase_invoice.posting_date = doc.posting_date
+            purchase_invoice.transaction_date = doc.posting_date
+            # Set due_date to posting_date + 1 day
+            if doc.posting_date:
+                purchase_invoice.due_date = add_days(doc.posting_date, 1)
             purchase_invoice.currency = currency
             purchase_invoice.conversion_rate = exchange_rate
 
@@ -264,17 +271,45 @@ def update_original_purchase_invoice_allocated_costs_on_submit_landed_cost_vouch
     try:
         # Step 1: Create Purchase Invoices from cost suppliers (if not already created)
         create_purchase_invoices_from_expenses(doc.name)
+        
+        # Commit to ensure service invoices are saved before processing
+        frappe.db.commit()
+
+        # Step 1.5: Delete existing rows created by this LCV to avoid duplicates
+        frappe.db.sql("""
+            DELETE FROM `tabAllocated Landed Cost`
+            WHERE parent = %s
+            AND parenttype = 'Purchase Invoice'
+            AND parentfield = 'custom_allocated_landed_cost'
+            AND (
+                (source_document_type = %s AND source_document = %s)
+                OR source_document IN (
+                    SELECT DISTINCT custom_expense_purchase_invoice
+                    FROM `tabLanded Cost Taxes and Charges`
+                    WHERE parent = %s
+                    AND custom_expense_purchase_invoice IS NOT NULL
+                    AND custom_expense_purchase_invoice != ''
+                )
+            )
+        """, (purchase_invoice_name, doc.doctype, doc.name, doc.name))
+
+        # Get company currency for fallback
+        company_currency = erpnext.get_company_currency(doc.company)
 
         # Step 2: Get ALL taxes with custom_service_item
         taxes_data = frappe.db.sql("""
             SELECT name, amount, base_amount, custom_service_item, 
-                   custom_expense_from_supplier, custom_expense_purchase_invoice
+                   custom_expense_from_supplier, custom_expense_purchase_invoice,
+                   account_currency
             FROM `tabLanded Cost Taxes and Charges`
             WHERE parent = %s
             AND custom_service_item IS NOT NULL
             AND custom_service_item != ''
             AND base_amount > 0
         """, (doc.name,), as_dict=True)
+
+        # Collect all rows to be created, then sort by source_document
+        rows_to_insert = []
 
         # Step 3: Create rows from LCV taxes table (for rows without custom_expense_from_supplier)
         for tax in taxes_data:
@@ -283,35 +318,46 @@ def update_original_purchase_invoice_allocated_costs_on_submit_landed_cost_vouch
             if tax.custom_expense_from_supplier:
                 continue
 
-            allocated_cost = frappe.new_doc("Allocated Landed Cost")
-            allocated_cost.parent = purchase_invoice_name
-            allocated_cost.parenttype = "Purchase Invoice"
-            allocated_cost.parentfield = "custom_allocated_landed_cost"
-            allocated_cost.custom_service_item = tax.custom_service_item
-            allocated_cost.item_amount = tax.amount
-            allocated_cost.item_base_amount = tax.base_amount
-            allocated_cost.item_base_tax_amount = 0.0
-            allocated_cost.source_document_type = doc.doctype
-            allocated_cost.source_document = doc.name
-            allocated_cost.db_insert()
+            # Get currency from account_currency, fallback to company currency
+            item_currency = tax.account_currency or company_currency
+
+            rows_to_insert.append({
+                "custom_service_item": tax.custom_service_item,
+                "item_amount": tax.amount,
+                "item_base_amount": tax.base_amount,
+                "item_base_tax_amount": 0.0,
+                "item_currency": item_currency,
+                "source_document_type": doc.doctype,
+                "source_document": doc.name
+            })
 
         # Step 4: Process service invoices (Purchase Invoices linked via custom_expense_purchase_invoice)
-        service_invoices = frappe.db.sql("""
-            SELECT DISTINCT custom_expense_purchase_invoice
+        # Get service invoices with their corresponding account_currency from LCV taxes
+        # Use GROUP BY to ensure we get one row per service invoice with its currency
+        service_invoices_data = frappe.db.sql("""
+            SELECT custom_expense_purchase_invoice, account_currency
             FROM `tabLanded Cost Taxes and Charges`
             WHERE parent = %s
             AND custom_expense_purchase_invoice IS NOT NULL
             AND custom_expense_purchase_invoice != ''
+            GROUP BY custom_expense_purchase_invoice, account_currency
         """, (doc.name,), as_dict=True)
 
-        for svc_inv in service_invoices:
-            service_invoice_name = svc_inv.custom_expense_purchase_invoice
+        for svc_inv_data in service_invoices_data:
+            service_invoice_name = svc_inv_data.custom_expense_purchase_invoice
+            # Get currency from LCV tax row (account_currency), fallback to company currency
+            service_invoice_currency = svc_inv_data.account_currency or company_currency
             
             # Check if service invoice exists
             if not frappe.db.exists("Purchase Invoice", service_invoice_name):
+                frappe.log_error(f"[landed_cost_voucher.py] Service invoice {service_invoice_name} does not exist")
                 continue
             
-            service_invoice_doc = frappe.get_doc("Purchase Invoice", service_invoice_name)
+            try:
+                service_invoice_doc = frappe.get_doc("Purchase Invoice", service_invoice_name)
+            except Exception as e:
+                frappe.log_error(f"[landed_cost_voucher.py] Failed to load service invoice {service_invoice_name}: {str(e)}")
+                continue
             
             # Submit service invoice if it's still in draft
             if service_invoice_doc.docstatus == 0:
@@ -321,11 +367,12 @@ def update_original_purchase_invoice_allocated_costs_on_submit_landed_cost_vouch
                     # Reload to get updated data after submit
                     service_invoice_doc = frappe.get_doc("Purchase Invoice", service_invoice_name)
                 except Exception as e:
-                    frappe.log_error(f"[landed_cost_voucher.py] Failed to submit service invoice {service_invoice_name}")
+                    frappe.log_error(f"[landed_cost_voucher.py] Failed to submit service invoice {service_invoice_name}: {str(e)}")
                     continue
             
             # Skip if not submitted (shouldn't happen after above, but safety check)
             if service_invoice_doc.docstatus != 1:
+                frappe.log_error(f"[landed_cost_voucher.py] Service invoice {service_invoice_name} is not submitted (docstatus={service_invoice_doc.docstatus})")
                 continue
 
             # Get items from service invoice
@@ -338,6 +385,10 @@ def update_original_purchase_invoice_allocated_costs_on_submit_landed_cost_vouch
                 AND item_code != ''
                 AND base_net_amount > 0
             """, (service_invoice_name,), as_dict=True)
+            
+            if not items_data:
+                frappe.log_error(f"[landed_cost_voucher.py] No items found for service invoice {service_invoice_name}")
+                continue
 
             # Calculate itemised tax from taxes table (for VAT)
             itemised_tax = {}
@@ -370,26 +421,57 @@ def update_original_purchase_invoice_allocated_costs_on_submit_landed_cost_vouch
                             base_tax = tax_data.get("base_tax_amount") or tax_data.get("tax_amount", 0)
                             item_base_tax_amount += flt(base_tax, 0)
 
-                # Add new row
-                allocated_cost = frappe.new_doc("Allocated Landed Cost")
-                allocated_cost.parent = purchase_invoice_name
-                allocated_cost.parenttype = "Purchase Invoice"
-                allocated_cost.parentfield = "custom_allocated_landed_cost"
-                allocated_cost.custom_service_item = item_code
-                allocated_cost.item_amount = item.net_amount  # Transaction currency amount (USD)
-                allocated_cost.item_base_amount = item.base_net_amount
-                allocated_cost.item_base_tax_amount = item_base_tax_amount
-                allocated_cost.source_document_type = "Purchase Invoice"
-                allocated_cost.source_document = service_invoice_name
-                allocated_cost.db_insert()
+                rows_to_insert.append({
+                    "custom_service_item": item_code,
+                    "item_amount": item.net_amount,  # Transaction currency amount (USD)
+                    "item_base_amount": base_net_amount,
+                    "item_base_tax_amount": item_base_tax_amount,
+                    "item_currency": service_invoice_currency,  # From LCV tax row account_currency
+                    "source_document_type": "Purchase Invoice",
+                    "source_document": service_invoice_name
+                })
+
+        # Step 5: Sort rows by source_document, then insert with proper idx
+        rows_to_insert.sort(key=lambda x: x.get("source_document", ""))
+        
+        # Get current max idx to continue from existing rows (after deletion)
+        max_idx = frappe.db.sql("""
+            SELECT COALESCE(MAX(idx), 0) as max_idx
+            FROM `tabAllocated Landed Cost`
+            WHERE parent = %s
+            AND parenttype = 'Purchase Invoice'
+            AND parentfield = 'custom_allocated_landed_cost'
+        """, (purchase_invoice_name,), as_dict=True)
+        
+        start_idx = (max_idx[0].max_idx if max_idx and max_idx[0].max_idx else 0) + 1
+        
+        # Insert rows with idx based on sorted order
+        for idx_offset, row_data in enumerate(rows_to_insert, start=0):
+            allocated_cost = frappe.new_doc("Allocated Landed Cost")
+            allocated_cost.parent = purchase_invoice_name
+            allocated_cost.parenttype = "Purchase Invoice"
+            allocated_cost.parentfield = "custom_allocated_landed_cost"
+            allocated_cost.idx = start_idx + idx_offset
+            allocated_cost.custom_service_item = row_data["custom_service_item"]
+            allocated_cost.item_amount = row_data["item_amount"]
+            allocated_cost.item_base_amount = row_data["item_base_amount"]
+            allocated_cost.item_base_tax_amount = row_data["item_base_tax_amount"]
+            allocated_cost.item_currency = row_data.get("item_currency") or company_currency
+            allocated_cost.source_document_type = row_data["source_document_type"]
+            allocated_cost.source_document = row_data["source_document"]
+            allocated_cost.db_insert()
 
         frappe.db.commit()
 
-        # Update totals in Purchase Invoice
-        update_allocated_costs_totals(purchase_invoice_name)
+        # Update totals in Purchase Invoice (wrap in try-except to prevent blocking)
+        try:
+            update_allocated_costs_totals(purchase_invoice_name)
+            frappe.db.commit()
+        except Exception as totals_error:
+            frappe.log_error(f"[landed_cost_voucher.py] update_allocated_costs_totals failed for {purchase_invoice_name}: {str(totals_error)}")
 
     except Exception as e:
-        frappe.log_error(f"[landed_cost_voucher.py] update_original_purchase_invoice_allocated_costs_on_submit_landed_cost_voucher")
+        frappe.log_error(f"[landed_cost_voucher.py] update_original_purchase_invoice_allocated_costs_on_submit_landed_cost_voucher: {str(e)}")
 
 
 @frappe.whitelist()
@@ -429,6 +511,9 @@ def update_original_purchase_invoice_allocated_costs(lcv_name):
         frappe.throw(_("Multiple Purchase Invoices found. Only one is supported."))
 
     try:
+        # Get company currency for fallback
+        company_currency = erpnext.get_company_currency(doc.company)
+
         # Step 1: Delete existing rows created by this LCV
         frappe.db.sql("""
             DELETE FROM `tabAllocated Landed Cost`
@@ -450,13 +535,17 @@ def update_original_purchase_invoice_allocated_costs(lcv_name):
         # Step 2: Get ALL taxes with custom_service_item
         taxes_data = frappe.db.sql("""
             SELECT name, amount, base_amount, custom_service_item, 
-                   custom_expense_from_supplier, custom_expense_purchase_invoice
+                   custom_expense_from_supplier, custom_expense_purchase_invoice,
+                   account_currency
             FROM `tabLanded Cost Taxes and Charges`
             WHERE parent = %s
             AND custom_service_item IS NOT NULL
             AND custom_service_item != ''
             AND base_amount > 0
         """, (doc.name,), as_dict=True)
+
+        # Collect all rows to be created, then sort by source_document
+        rows_to_insert = []
 
         # Step 3: Create rows from LCV taxes table (for rows without custom_expense_from_supplier)
         for tax in taxes_data:
@@ -465,35 +554,46 @@ def update_original_purchase_invoice_allocated_costs(lcv_name):
             if tax.custom_expense_from_supplier:
                 continue
 
-            allocated_cost = frappe.new_doc("Allocated Landed Cost")
-            allocated_cost.parent = purchase_invoice_name
-            allocated_cost.parenttype = "Purchase Invoice"
-            allocated_cost.parentfield = "custom_allocated_landed_cost"
-            allocated_cost.custom_service_item = tax.custom_service_item
-            allocated_cost.item_amount = tax.amount
-            allocated_cost.item_base_amount = tax.base_amount
-            allocated_cost.item_base_tax_amount = 0.0
-            allocated_cost.source_document_type = doc.doctype
-            allocated_cost.source_document = doc.name
-            allocated_cost.db_insert()
+            # Get currency from account_currency, fallback to company currency
+            item_currency = tax.account_currency or company_currency
+
+            rows_to_insert.append({
+                "custom_service_item": tax.custom_service_item,
+                "item_amount": tax.amount,
+                "item_base_amount": tax.base_amount,
+                "item_base_tax_amount": 0.0,
+                "item_currency": item_currency,
+                "source_document_type": doc.doctype,
+                "source_document": doc.name
+            })
 
         # Step 4: Process service invoices (Purchase Invoices linked via custom_expense_purchase_invoice)
-        service_invoices = frappe.db.sql("""
-            SELECT DISTINCT custom_expense_purchase_invoice
+        # Get service invoices with their corresponding account_currency from LCV taxes
+        # Use GROUP BY to ensure we get one row per service invoice with its currency
+        service_invoices_data = frappe.db.sql("""
+            SELECT custom_expense_purchase_invoice, account_currency
             FROM `tabLanded Cost Taxes and Charges`
             WHERE parent = %s
             AND custom_expense_purchase_invoice IS NOT NULL
             AND custom_expense_purchase_invoice != ''
+            GROUP BY custom_expense_purchase_invoice, account_currency
         """, (doc.name,), as_dict=True)
 
-        for svc_inv in service_invoices:
-            service_invoice_name = svc_inv.custom_expense_purchase_invoice
+        for svc_inv_data in service_invoices_data:
+            service_invoice_name = svc_inv_data.custom_expense_purchase_invoice
+            # Get currency from LCV tax row (account_currency), fallback to company currency
+            service_invoice_currency = svc_inv_data.account_currency or company_currency
             
             # Check if service invoice exists
             if not frappe.db.exists("Purchase Invoice", service_invoice_name):
+                frappe.log_error(f"[landed_cost_voucher.py] Service invoice {service_invoice_name} does not exist")
                 continue
             
-            service_invoice_doc = frappe.get_doc("Purchase Invoice", service_invoice_name)
+            try:
+                service_invoice_doc = frappe.get_doc("Purchase Invoice", service_invoice_name)
+            except Exception as e:
+                frappe.log_error(f"[landed_cost_voucher.py] Failed to load service invoice {service_invoice_name}: {str(e)}")
+                continue
             
             # Submit service invoice if it's still in draft
             if service_invoice_doc.docstatus == 0:
@@ -503,11 +603,12 @@ def update_original_purchase_invoice_allocated_costs(lcv_name):
                     # Reload to get updated data after submit
                     service_invoice_doc = frappe.get_doc("Purchase Invoice", service_invoice_name)
                 except Exception as e:
-                    frappe.log_error(f"[landed_cost_voucher.py] Failed to submit service invoice {service_invoice_name}")
+                    frappe.log_error(f"[landed_cost_voucher.py] Failed to submit service invoice {service_invoice_name}: {str(e)}")
                     continue
             
             # Skip if not submitted (shouldn't happen after above, but safety check)
             if service_invoice_doc.docstatus != 1:
+                frappe.log_error(f"[landed_cost_voucher.py] Service invoice {service_invoice_name} is not submitted (docstatus={service_invoice_doc.docstatus})")
                 continue
 
             # Get items from service invoice
@@ -520,6 +621,10 @@ def update_original_purchase_invoice_allocated_costs(lcv_name):
                 AND item_code != ''
                 AND base_net_amount > 0
             """, (service_invoice_name,), as_dict=True)
+            
+            if not items_data:
+                frappe.log_error(f"[landed_cost_voucher.py] No items found for service invoice {service_invoice_name}")
+                continue
 
             # Calculate itemised tax from taxes table (for VAT)
             itemised_tax = {}
@@ -552,28 +657,59 @@ def update_original_purchase_invoice_allocated_costs(lcv_name):
                             base_tax = tax_data.get("base_tax_amount") or tax_data.get("tax_amount", 0)
                             item_base_tax_amount += flt(base_tax, 0)
 
-                # Add new row
-                allocated_cost = frappe.new_doc("Allocated Landed Cost")
-                allocated_cost.parent = purchase_invoice_name
-                allocated_cost.parenttype = "Purchase Invoice"
-                allocated_cost.parentfield = "custom_allocated_landed_cost"
-                allocated_cost.custom_service_item = item_code
-                allocated_cost.item_amount = item.net_amount  # Transaction currency amount (USD)
-                allocated_cost.item_base_amount = item.base_net_amount
-                allocated_cost.item_base_tax_amount = item_base_tax_amount
-                allocated_cost.source_document_type = "Purchase Invoice"
-                allocated_cost.source_document = service_invoice_name
-                allocated_cost.db_insert()
+                rows_to_insert.append({
+                    "custom_service_item": item_code,
+                    "item_amount": item.net_amount,  # Transaction currency amount (USD)
+                    "item_base_amount": base_net_amount,
+                    "item_base_tax_amount": item_base_tax_amount,
+                    "item_currency": service_invoice_currency,  # From LCV tax row account_currency
+                    "source_document_type": "Purchase Invoice",
+                    "source_document": service_invoice_name
+                })
+
+        # Step 5: Sort rows by source_document, then insert with proper idx
+        rows_to_insert.sort(key=lambda x: x.get("source_document", ""))
+        
+        # Get current max idx to continue from existing rows (after deletion)
+        max_idx = frappe.db.sql("""
+            SELECT COALESCE(MAX(idx), 0) as max_idx
+            FROM `tabAllocated Landed Cost`
+            WHERE parent = %s
+            AND parenttype = 'Purchase Invoice'
+            AND parentfield = 'custom_allocated_landed_cost'
+        """, (purchase_invoice_name,), as_dict=True)
+        
+        start_idx = (max_idx[0].max_idx if max_idx and max_idx[0].max_idx else 0) + 1
+        
+        # Insert rows with idx based on sorted order
+        for idx_offset, row_data in enumerate(rows_to_insert, start=0):
+            allocated_cost = frappe.new_doc("Allocated Landed Cost")
+            allocated_cost.parent = purchase_invoice_name
+            allocated_cost.parenttype = "Purchase Invoice"
+            allocated_cost.parentfield = "custom_allocated_landed_cost"
+            allocated_cost.idx = start_idx + idx_offset
+            allocated_cost.custom_service_item = row_data["custom_service_item"]
+            allocated_cost.item_amount = row_data["item_amount"]
+            allocated_cost.item_base_amount = row_data["item_base_amount"]
+            allocated_cost.item_base_tax_amount = row_data["item_base_tax_amount"]
+            allocated_cost.item_currency = row_data.get("item_currency") or company_currency
+            allocated_cost.source_document_type = row_data["source_document_type"]
+            allocated_cost.source_document = row_data["source_document"]
+            allocated_cost.db_insert()
 
         frappe.db.commit()
 
-        # Update totals in Purchase Invoice
-        update_allocated_costs_totals(purchase_invoice_name)
+        # Update totals in Purchase Invoice (wrap in try-except to prevent blocking)
+        try:
+            update_allocated_costs_totals(purchase_invoice_name)
+            frappe.db.commit()
+        except Exception as totals_error:
+            frappe.log_error(f"[landed_cost_voucher.py] update_allocated_costs_totals failed for {purchase_invoice_name}: {str(totals_error)}")
         
         return {"success": True, "message": _("Original Purchase Invoice updated successfully")}
 
     except Exception as e:
-        frappe.log_error(f"[landed_cost_voucher.py] update_original_purchase_invoice_allocated_costs")
+        frappe.log_error(f"[landed_cost_voucher.py] update_original_purchase_invoice_allocated_costs: {str(e)}")
         frappe.throw(_("Error updating Original Purchase Invoice: {0}").format(str(e)))
 
 
@@ -644,11 +780,15 @@ def update_original_purchase_invoice_allocated_costs_on_cancel_landed_cost_vouch
 
         frappe.db.commit()
 
-        # Update totals in Purchase Invoice
-        update_allocated_costs_totals(purchase_invoice_name)
+        # Update totals in Purchase Invoice (wrap in try-except to prevent blocking)
+        try:
+            update_allocated_costs_totals(purchase_invoice_name)
+            frappe.db.commit()
+        except Exception as totals_error:
+            frappe.log_error(f"[landed_cost_voucher.py] update_allocated_costs_totals failed for {purchase_invoice_name}: {str(totals_error)}")
 
     except Exception as e:
-        frappe.log_error(f"[landed_cost_voucher.py] update_original_purchase_invoice_allocated_costs_on_cancel_landed_cost_voucher")
+        frappe.log_error(f"[landed_cost_voucher.py] update_original_purchase_invoice_allocated_costs_on_cancel_landed_cost_voucher: {str(e)}")
 
 
 
