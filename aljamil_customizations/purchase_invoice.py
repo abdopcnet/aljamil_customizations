@@ -45,7 +45,7 @@ def update_original_purchase_invoice_allocated_costs_on_submit_cost_purchase_inv
         # Get items from current Purchase Invoice using SQL
         # Use base_net_amount directly from database (base currency, item level)
         items_data = frappe.db.sql("""
-            SELECT item_code, base_net_amount, item_tax_rate
+            SELECT item_code, amount, base_net_amount, item_tax_rate
             FROM `tabPurchase Invoice Item`
             WHERE parent = %s
             AND item_code IS NOT NULL
@@ -88,7 +88,8 @@ def update_original_purchase_invoice_allocated_costs_on_submit_cost_purchase_inv
             allocated_cost.parenttype = "Purchase Invoice"
             allocated_cost.parentfield = "custom_allocated_landed_cost"
             allocated_cost.custom_service_item = item_code
-            allocated_cost.item_base_amount = base_net_amount
+            allocated_cost.item_amount = item.amount
+            allocated_cost.item_base_amount = item.base_net_amount
             allocated_cost.item_base_tax_amount = item_base_tax_amount
             allocated_cost.source_document_type = source_document_type
             allocated_cost.source_document = source_document_name
@@ -239,7 +240,7 @@ def recalculate_allocated_costs_from_pi(source_purchase_invoice_name):
         # Get items from source Purchase Invoice using SQL
         # Use base_net_amount directly from database (base currency, item level)
         items_data = frappe.db.sql("""
-            SELECT item_code, base_net_amount, item_tax_rate
+            SELECT item_code, amount, base_net_amount, item_tax_rate
             FROM `tabPurchase Invoice Item`
             WHERE parent = %s
             AND item_code IS NOT NULL
@@ -282,7 +283,8 @@ def recalculate_allocated_costs_from_pi(source_purchase_invoice_name):
             allocated_cost.parenttype = "Purchase Invoice"
             allocated_cost.parentfield = "custom_allocated_landed_cost"
             allocated_cost.custom_service_item = item_code
-            allocated_cost.item_base_amount = base_net_amount
+            allocated_cost.item_amount = item.amount
+            allocated_cost.item_base_amount = item.base_net_amount
             allocated_cost.item_base_tax_amount = item_base_tax_amount
             allocated_cost.source_document_type = source_document_type
             allocated_cost.source_document = source_document_name
