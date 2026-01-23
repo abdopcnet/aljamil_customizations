@@ -6,12 +6,42 @@ frappe.ui.form.on('Purchase Invoice', {
 	},
 
 	refresh(frm) {
-
-		if (!frm.fields_dict.items) return;
-		const grid = frm.fields_dict.items.grid;
-		if (!grid) return;
-
+		// Show button to fetch landed costs when submitted
 		if (frm.doc && frm.doc.docstatus === 1) {
+			frm.page.add_inner_button(__("Fetch Landed Costs"), function() {
+				frappe.confirm(
+					__("Are you sure you want to fetch and update allocated costs from related Landed Cost Vouchers?"),
+					function() {
+						frappe.call({
+							method: "aljamil_customizations.purchase_invoice.fetch_landed_costs_from_lcv",
+							args: {
+								purchase_invoice_name: frm.doc.name
+							},
+							freeze: true,
+							freeze_message: __("Fetching Landed Costs..."),
+							callback: function(r) {
+								if (r.message) {
+									frappe.msgprint({
+										title: __("Success"),
+										message: __("Landed costs have been fetched and updated successfully."),
+										indicator: "green"
+									});
+									// Refresh form to show updated data
+									frm.reload_doc();
+								}
+							},
+							error: function(r) {
+								frappe.msgprint({
+									title: __("Error"),
+									message: r.message || __("An error occurred while fetching landed costs"),
+									indicator: "red"
+								});
+							}
+						});
+					}
+				);
+			}, null, "success");
+
 			if (frm._multi_add_button_pi && frm._multi_add_button_pi.remove) {
 				try { frm._multi_add_button_pi.remove(); } catch (e) {}
 				frm._multi_add_button_pi = null;
