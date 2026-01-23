@@ -9,7 +9,12 @@ frappe.provide("aljamil_customizations.landed_cost_voucher");
 // Extend Landed Cost Voucher class
 frappe.ui.form.on("Landed Cost Voucher", {
     refresh: function(frm) {
-        // Button removed - Purchase Invoices are now created automatically on submit
+        // Show backup button after submit to manually update original Purchase Invoice
+        if (frm.doc.docstatus === 1) {
+            frm.page.add_inner_button(__("Update Original Purchase Invoice"), function() {
+                aljamil_customizations.landed_cost_voucher.update_original_invoice(frm);
+            }, null, "primary");
+        }
     },
 
     validate: function(frm) {
@@ -105,7 +110,142 @@ frappe.ui.form.on("Landed Cost Voucher", {
     }
 });
 
-// Function to create Purchase Invoices
+// Function to create Cost Invoices (button action)
+aljamil_customizations.landed_cost_voucher.create_cost_invoices = function(frm) {
+    frappe.confirm(
+        __("Are you sure you want to create Cost Purchase Invoices for supplier expenses?"),
+        function() {
+            frappe.call({
+                method: "aljamil_customizations.landed_cost_voucher.create_purchase_invoices_from_expenses",
+                args: {
+                    doc_name: frm.doc.name
+                },
+                freeze: true,
+                freeze_message: __("Creating Cost Purchase Invoices..."),
+                callback: function(r) {
+                    if (r.message) {
+                        var msg = "";
+
+                        if (r.message.created_invoices && r.message.created_invoices.length > 0) {
+                            msg += "<div style='margin-top: 10px;'>";
+                            msg += "<h4 style='color: green; margin-bottom: 10px;'>" + __("Created Purchase Invoices:") + "</h4>";
+                            msg += "<table class='table table-bordered' style='margin-bottom: 0; table-layout: auto; width: 100%;'>";
+                            msg += "<thead><tr>";
+                            msg += "<th style='white-space: nowrap; padding: 8px;'>" + __("Invoice") + "</th>";
+                            msg += "<th style='white-space: nowrap; padding: 8px;'>" + __("Supplier") + "</th>";
+                            msg += "<th style='white-space: nowrap; padding: 8px; text-align: center;'>" + __("Items") + "</th>";
+                            msg += "<th style='white-space: nowrap; padding: 8px; text-align: right;'>" + __("Amount") + "</th>";
+                            msg += "</tr></thead>";
+                            msg += "<tbody>";
+                            r.message.created_invoices.forEach(function(inv) {
+                                var formatted_amount = inv.total_amount;
+                                try {
+                                    if (typeof format_currency === 'function') {
+                                        formatted_amount = format_currency(inv.total_amount, frm.doc.company);
+                                    } else if (typeof frappe.format !== 'undefined') {
+                                        formatted_amount = frappe.format(inv.total_amount, {
+                                            fieldtype: "Currency",
+                                            options: frm.doc.company
+                                        });
+                                    }
+                                } catch(e) {
+                                    // Use raw amount if formatting fails
+                                }
+
+                                var invoice_link = frappe.utils.get_form_link(
+                                    "Purchase Invoice",
+                                    inv.invoice,
+                                    true,
+                                    inv.invoice
+                                );
+                                msg += "<tr>";
+                                msg += "<td style='white-space: nowrap; padding: 8px;'>" + invoice_link + "</td>";
+                                msg += "<td style='white-space: nowrap; padding: 8px;'>" + inv.supplier + "</td>";
+                                msg += "<td style='white-space: nowrap; padding: 8px; text-align: center;'>" + inv.items_count + "</td>";
+                                msg += "<td style='white-space: nowrap; padding: 8px; text-align: right;'>" + formatted_amount + "</td>";
+                                msg += "</tr>";
+                            });
+                            msg += "</tbody></table>";
+                            msg += "</div>";
+                        }
+
+                        if (r.message.errors && r.message.errors.length > 0) {
+                            msg += "<div style='margin-top: 15px;'>";
+                            msg += "<h4 style='color: red; margin-bottom: 10px;'>" + __("Errors:") + "</h4>";
+                            msg += "<table class='table table-bordered' style='margin-bottom: 0; table-layout: auto; width: 100%;'>";
+                            msg += "<thead><tr>";
+                            msg += "<th style='white-space: nowrap; padding: 8px;'>" + __("Supplier") + "</th>";
+                            msg += "<th style='white-space: nowrap; padding: 8px;'>" + __("Error") + "</th>";
+                            msg += "</tr></thead>";
+                            msg += "<tbody>";
+                            r.message.errors.forEach(function(err) {
+                                msg += "<tr>";
+                                msg += "<td style='white-space: nowrap; padding: 8px;'>" + err.supplier + "</td>";
+                                msg += "<td style='white-space: nowrap; padding: 8px; color: red;'>" + err.error + "</td>";
+                                msg += "</tr>";
+                            });
+                            msg += "</tbody></table>";
+                            msg += "</div>";
+                        }
+
+                        frappe.msgprint({
+                            title: __("Cost Purchase Invoices Created"),
+                            message: msg,
+                            indicator: r.message.errors && r.message.errors.length > 0 ? "orange" : "green"
+                        });
+
+                        // Refresh form to show new Purchase Invoice references
+                        frm.reload_doc();
+                    }
+                },
+                error: function(r) {
+                    frappe.msgprint({
+                        title: __("Error"),
+                        message: r.message || __("An error occurred while creating Purchase Invoices"),
+                        indicator: "red"
+                    });
+                }
+            });
+        }
+    );
+};
+
+// Function to update Original Invoice (button action)
+aljamil_customizations.landed_cost_voucher.update_original_invoice = function(frm) {
+    frappe.confirm(
+        __("Are you sure you want to update the Original Purchase Invoice with allocated costs? This will sync/create/update rows in the Allocated Landed Cost table."),
+        function() {
+            frappe.call({
+                method: "aljamil_customizations.landed_cost_voucher.update_original_purchase_invoice_allocated_costs",
+                args: {
+                    lcv_name: frm.doc.name
+                },
+                freeze: true,
+                freeze_message: __("Updating Original Purchase Invoice..."),
+                callback: function(r) {
+                    if (r.message) {
+                        frappe.msgprint({
+                            title: __("Success"),
+                            message: __("Original Purchase Invoice has been updated successfully."),
+                            indicator: "green"
+                        });
+                        // Refresh form
+                        frm.reload_doc();
+                    }
+                },
+                error: function(r) {
+                    frappe.msgprint({
+                        title: __("Error"),
+                        message: r.message || __("An error occurred while updating the Original Purchase Invoice"),
+                        indicator: "red"
+                    });
+                }
+            });
+        }
+    );
+};
+
+// Function to create Purchase Invoices (old function - kept for backward compatibility)
 aljamil_customizations.landed_cost_voucher.create_purchase_invoices = function(frm) {
     // Validate required fields and check if Purchase Invoice already exists
     var missing_fields = [];
