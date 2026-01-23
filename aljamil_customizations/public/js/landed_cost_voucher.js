@@ -226,7 +226,7 @@ aljamil_customizations.landed_cost_voucher.update_original_invoice = function(fr
                     if (r.message) {
                         frappe.msgprint({
                             title: __("Success"),
-                            message: __("Original Purchase Invoice has been updated successfully."),
+                            message: __("Updated Original Purchase Invoice"),
                             indicator: "green"
                         });
                         // Refresh form
