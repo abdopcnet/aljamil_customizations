@@ -19,38 +19,41 @@ def update_allocated_costs_totals(doc, method=None):
         # Called as hook
         pi_doc = doc
         pi_name = doc.name
-    else:
-        # Called directly with doc_name
-        pi_name = doc
-        pi_doc = frappe.get_doc("Purchase Invoice", pi_name)
+        
+        # Calculate totals from child table using new fields
+        total_cost = 0.0
+        total_vat = 0.0
 
-    if not pi_doc.get("custom_allocated_landed_cost"):
-        # No allocated costs, set totals to 0
-        if method:
-            pi_doc.custom_total_cost = 0.0
-            pi_doc.custom_vat_on_costs = 0.0
-        else:
-            frappe.db.set_value("Purchase Invoice", pi_name, {
-                "custom_total_cost": 0.0,
-                "custom_vat_on_costs": 0.0
-            })
-        return
+        for row in pi_doc.get("custom_allocated_landed_cost", []):
+            total_cost += flt(row.item_base_amount or 0)
+            total_vat += flt(row.item_base_tax_amount or 0)
 
-    # Calculate totals from child table using new fields
-    total_cost = 0.0
-    total_vat = 0.0
-
-    for row in pi_doc.get("custom_allocated_landed_cost", []):
-        total_cost += flt(row.item_base_amount or 0)
-        total_vat += flt(row.item_base_tax_amount or 0)
-
-    # Update fields
-    if method:
-        # Called as hook - update doc directly
+        # Update doc directly
         pi_doc.custom_total_cost = total_cost
         pi_doc.custom_vat_on_costs = total_vat
     else:
-        # Called directly - update via db
+        # Called directly - use SQL to avoid loading document and triggering validation
+        pi_name = doc
+        
+        # Calculate totals directly from database using SQL
+        totals = frappe.db.sql("""
+            SELECT 
+                COALESCE(SUM(item_base_amount), 0) as total_cost,
+                COALESCE(SUM(item_base_tax_amount), 0) as total_vat
+            FROM `tabAllocated Landed Cost`
+            WHERE parent = %s
+            AND parenttype = 'Purchase Invoice'
+            AND parentfield = 'custom_allocated_landed_cost'
+        """, (pi_name,), as_dict=True)
+        
+        if totals and len(totals) > 0:
+            total_cost = flt(totals[0].total_cost or 0)
+            total_vat = flt(totals[0].total_vat or 0)
+        else:
+            total_cost = 0.0
+            total_vat = 0.0
+        
+        # Update via db.set_value (doesn't trigger validation)
         frappe.db.set_value("Purchase Invoice", pi_name, {
             "custom_total_cost": total_cost,
             "custom_vat_on_costs": total_vat
