@@ -9,18 +9,15 @@ frappe.provide("aljamil_customizations.landed_cost_voucher");
 // Extend Landed Cost Voucher class
 frappe.ui.form.on("Landed Cost Voucher", {
     refresh: function(frm) {
-        // Add button to create Purchase Invoices from supplier expenses
-        if (frm.doc.docstatus === 0) {
-            frm.add_custom_button(
-                __("Create Cost Invoice"),
-                function() {
-                    aljamil_customizations.landed_cost_voucher.create_purchase_invoices(frm);
-                }
-            );
-        }
+        // Button removed - Purchase Invoices are now created automatically on submit
     },
 
     validate: function(frm) {
+        // Skip validation if document is submitted - don't modify fields not allowed on submit
+        if (frm.doc.docstatus === 1) {
+            return;
+        }
+
         // Clear fields to prevent mandatory field errors
         if (frm.doc.taxes) {
             let needs_refresh = false;
@@ -48,6 +45,63 @@ frappe.ui.form.on("Landed Cost Voucher", {
                 frm.refresh_field("taxes");
             }
         }
+    },
+
+    on_submit: function(frm) {
+        // Reload form to show updated custom_expense_purchase_invoice values
+        frm.reload_doc().then(function() {
+            // Get created invoices from form data (no need to query database)
+            if (frm.doc.taxes && frm.doc.taxes.length > 0) {
+                let created_invoices = [];
+                let seen_invoices = {};
+                
+                frm.doc.taxes.forEach(function(tax) {
+                    // Check if this row has expense from supplier and has a purchase invoice
+                    if (cint(tax.custom_expense_from_supplier) === 1 && 
+                        tax.custom_expense_purchase_invoice && 
+                        !seen_invoices[tax.custom_expense_purchase_invoice]) {
+                        seen_invoices[tax.custom_expense_purchase_invoice] = true;
+                        created_invoices.push({
+                            invoice: tax.custom_expense_purchase_invoice,
+                            supplier: tax.custom_expense_supplier
+                        });
+                    }
+                });
+
+                if (created_invoices.length > 0) {
+                    let msg = "<div style='margin-top: 10px;'>";
+                    msg += "<h4 style='color: green; margin-bottom: 10px;'>" + __("Cost Purchase Invoices Created:") + "</h4>";
+                    msg += "<table class='table table-bordered' style='margin-bottom: 0; table-layout: auto; width: 100%;'>";
+                    msg += "<thead><tr>";
+                    msg += "<th style='white-space: nowrap; padding: 8px;'>" + __("Invoice") + "</th>";
+                    msg += "<th style='white-space: nowrap; padding: 8px;'>" + __("Supplier") + "</th>";
+                    msg += "</tr></thead>";
+                    msg += "<tbody>";
+                    
+                    created_invoices.forEach(function(inv) {
+                        var invoice_link = frappe.utils.get_form_link(
+                            "Purchase Invoice",
+                            inv.invoice,
+                            true,
+                            inv.invoice
+                        );
+                        msg += "<tr>";
+                        msg += "<td style='white-space: nowrap; padding: 8px;'>" + invoice_link + "</td>";
+                        msg += "<td style='white-space: nowrap; padding: 8px;'>" + (inv.supplier || "") + "</td>";
+                        msg += "</tr>";
+                    });
+                    
+                    msg += "</tbody></table>";
+                    msg += "</div>";
+
+                    frappe.msgprint({
+                        title: __("Cost Invoices Created"),
+                        message: msg,
+                        indicator: "green"
+                    });
+                }
+            }
+        });
     }
 });
 
