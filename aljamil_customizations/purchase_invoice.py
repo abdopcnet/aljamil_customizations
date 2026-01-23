@@ -244,3 +244,85 @@ def refresh_allocated_costs_totals(purchase_invoice_name):
     except Exception as e:
         frappe.log_error(f"[purchase_invoice.py] refresh_allocated_costs_totals")
         return {"total_cost": 0.0, "total_vat": 0.0}
+
+
+@frappe.whitelist()
+def fetch_landed_costs_from_lcv(purchase_invoice_name):
+    """
+    Fetch and update allocated costs from related Landed Cost Vouchers.
+    Called from button "Fetch Landed Costs" in Purchase Invoice.
+    
+    Logic:
+    1. Find all submitted LCVs related to this Purchase Invoice
+    2. For each LCV, update allocated costs (same logic as on_submit)
+    3. Update totals
+    """
+    if not purchase_invoice_name:
+        frappe.throw(_("Purchase Invoice name is required"))
+    
+    if not frappe.db.exists("Purchase Invoice", purchase_invoice_name):
+        frappe.throw(_("Purchase Invoice not found"))
+    
+    pi_docstatus = frappe.db.get_value("Purchase Invoice", purchase_invoice_name, "docstatus")
+    if pi_docstatus != 1:
+        frappe.throw(_("Purchase Invoice must be submitted first"))
+    
+    try:
+        # Step 1: Delete all existing allocated cost rows for this Purchase Invoice
+        # (to prevent duplicates when fetching again)
+        frappe.db.sql("""
+            DELETE FROM `tabAllocated Landed Cost`
+            WHERE parent = %s
+            AND parenttype = 'Purchase Invoice'
+            AND parentfield = 'custom_allocated_landed_cost'
+        """, (purchase_invoice_name,))
+        
+        # Step 2: Find all submitted LCVs related to this Purchase Invoice
+        lcv_list = frappe.db.sql("""
+            SELECT DISTINCT parent as lcv_name
+            FROM `tabLanded Cost Purchase Receipt`
+            WHERE receipt_document = %s
+            AND receipt_document_type = 'Purchase Invoice'
+        """, (purchase_invoice_name,), as_dict=True)
+        
+        if not lcv_list:
+            frappe.db.commit()
+            return {"success": True, "message": _("No related Landed Cost Vouchers found")}
+        
+        updated_count = 0
+        for lcv_row in lcv_list:
+            lcv_name = lcv_row.lcv_name
+            try:
+                # Check if LCV exists and is submitted
+                if not frappe.db.exists("Landed Cost Voucher", lcv_name):
+                    continue
+                
+                lcv_docstatus = frappe.db.get_value("Landed Cost Voucher", lcv_name, "docstatus")
+                if lcv_docstatus != 1:
+                    continue
+                
+                # Import here to avoid circular import
+                from aljamil_customizations.landed_cost_voucher import (
+                    update_original_purchase_invoice_allocated_costs_on_submit_landed_cost_voucher
+                )
+                
+                lcv_doc = frappe.get_doc("Landed Cost Voucher", lcv_name)
+                update_original_purchase_invoice_allocated_costs_on_submit_landed_cost_voucher(lcv_doc, None)
+                updated_count += 1
+            except Exception as e:
+                frappe.log_error(f"[purchase_invoice.py] fetch_landed_costs_from_lcv - Error processing LCV {lcv_name}")
+                continue
+        
+        frappe.db.commit()
+        
+        # Step 3: Update totals
+        update_allocated_costs_totals(purchase_invoice_name)
+        
+        return {
+            "success": True,
+            "message": _("Updated allocated costs from {0} Landed Cost Voucher(s)").format(updated_count)
+        }
+        
+    except Exception as e:
+        frappe.log_error(f"[purchase_invoice.py] fetch_landed_costs_from_lcv")
+        frappe.throw(_("Error fetching landed costs: {0}").format(str(e)))
