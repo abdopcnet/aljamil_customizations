@@ -137,9 +137,9 @@ doctype_js = {
 # permission_query_conditions = {
 # 	"Event": "frappe.desk.doctype.event.event.get_permission_query_conditions",
 # }
-#
+
 # has_permission = {
-# 	"Event": "frappe.desk.doctype.event.event.has_permission",
+# 	"Allocated Landed Cost": "aljamil_customizations.landed_cost_voucher.has_permission_for_allocated_landed_cost",
 # }
 
 # DocType Class
@@ -168,8 +168,6 @@ doc_events = {
     },
     "Purchase Invoice": {
         "validate": "aljamil_customizations.purchase_invoice.update_allocated_costs_totals",
-        "on_submit": "aljamil_customizations.purchase_invoice.update_original_purchase_invoice_allocated_costs_on_submit_cost_purchase_invoice",
-        "on_cancel": "aljamil_customizations.purchase_invoice.update_original_purchase_invoice_allocated_costs_on_cancel_cost_purchase_invoice",
     },
 }
 
