@@ -54,12 +54,6 @@ doctype_js = {
     "Purchase Order": [
         "public/js/purchase_order.js",
     ],
-    "Purchase Invoice": [
-        "public/js/purchase_invoice.js",
-    ],
-    "Landed Cost Voucher": [
-        "public/js/landed_cost_voucher.js",
-    ]
 }
 # doctype_list_js = {"doctype" : "public/js/doctype_list.js"}
 # doctype_tree_js = {"doctype" : "public/js/doctype_tree.js"}
@@ -160,14 +154,6 @@ doc_events = {
     },
     "Sales Invoice": {
         "before_save": "aljamil_customizations.sales_invoice.send_discount_approval_notifications",
-    },
-    "Landed Cost Voucher": {
-        "validate": "aljamil_customizations.landed_cost_voucher.validate_landed_cost_voucher_taxes",
-        "on_submit": "aljamil_customizations.landed_cost_voucher.update_original_purchase_invoice_allocated_costs_on_submit_landed_cost_voucher",
-        "on_cancel": "aljamil_customizations.landed_cost_voucher.update_original_purchase_invoice_allocated_costs_on_cancel_landed_cost_voucher",
-    },
-    "Purchase Invoice": {
-        "validate": "aljamil_customizations.purchase_invoice.update_allocated_costs_totals",
     },
 }
 
